@@ -1,0 +1,1 @@
+Test SDR GPS to locate satellite. The efficient chip would be collecting digitized GNSS radio samples and outputting per-satellite timing/frequency measurements needed to determine the CubeSat’s own position, velocity, and time. 
