@@ -20,6 +20,13 @@
 #define NCO_LUT_SIZE         (1 << NCO_LUT_BITS)
 #define NCO_LUT_MASK         (NCO_LUT_SIZE - 1)
 
+#define DEBUG_PRINT
+#ifdef DEBUG_PRINT
+#define DBG_PRINTF(...) printf(__VA_ARGS__)
+#else
+#define DBG_PRINTF(...)
+#endif
+
 /* Q15 cosine/sine LUT, 256 samples over 2*pi */
 static const int16_t cos_lut_q15[NCO_LUT_SIZE] = {
     32767,32757,32728,32678,32609,32521,32412,32285,
@@ -348,7 +355,6 @@ static int read_gnss_samples_1ms(iq16_t *dst, int samples_per_ms)
 }
 
 /* ---------------- main ---------------- */
-
 int main(void)
 {
     const uint32_t fs_hz = 5000000u;
@@ -362,23 +368,41 @@ int main(void)
 
     memset(tracks, 0, sizeof(tracks));
 
+    DBG_PRINTF("[DEBUG] main start\r\n");
+    DBG_PRINTF("[DEBUG] fs_hz=%lu samples_per_ms=%d\r\n",
+               (unsigned long)fs_hz, samples_per_ms);
+
     if (samples_per_ms > MAX_SAMPLES_MS) {
+        DBG_PRINTF("[DEBUG] samples_per_ms exceeds MAX_SAMPLES_MS\r\n");
         return -1;
     }
 
+    DBG_PRINTF("[DEBUG] initializing UART\r\n");
     if (uart_init_for_gnss()) {
+        DBG_PRINTF("[DEBUG] uart_init_for_gnss failed\r\n");
         return -1;
     }
 
     eff_uart_puts(UART_DEV, "GNSS SDR start\r\n");
+    DBG_PRINTF("[DEBUG] GNSS SDR start\r\n");
 
+    DBG_PRINTF("[DEBUG] reading initial 1ms GNSS samples\r\n");
     if (!read_gnss_samples_1ms(raw_1ms, samples_per_ms)) {
         eff_uart_puts(UART_DEV, "sample input failed\r\n");
+        DBG_PRINTF("[DEBUG] initial sample input failed\r\n");
         return -1;
     }
 
+    DBG_PRINTF("[DEBUG] starting acquisition search\r\n");
     for (int prn = 1; prn <= MAX_PRNS_TO_SEARCH && track_count < MAX_TRACKS; prn++) {
         acq_result_t acq = acquire_one_prn(raw_1ms, samples_per_ms, fs_hz, prn);
+
+        DBG_PRINTF("[DEBUG] PRN=%d found=%d metric=%ld doppler=%ld code_phase=%d\r\n",
+                   prn,
+                   acq.found ? 1 : 0,
+                   (long)acq.metric,
+                   (long)acq.doppler_hz,
+                   acq.code_phase);
 
         if (acq.found && acq.metric > ACQ_METRIC_THRESHOLD) {
             tracks[track_count].locked = true;
@@ -387,26 +411,51 @@ int main(void)
             tracks[track_count].code_phase = acq.code_phase;
             tracks[track_count].carrier_phase_q16 = 0;
             tracks[track_count].code_rate_q16 = 0;
+
+            DBG_PRINTF("[DEBUG] track locked: slot=%d PRN=%d doppler=%ld code_phase=%d metric=%ld\r\n",
+                       track_count,
+                       acq.prn,
+                       (long)acq.doppler_hz,
+                       acq.code_phase,
+                       (long)acq.metric);
+
             track_count++;
         }
     }
 
+    DBG_PRINTF("[DEBUG] acquisition complete, track_count=%d\r\n", track_count);
+
     while (1) {
         if (!read_gnss_samples_1ms(raw_1ms, samples_per_ms)) {
             eff_uart_puts(UART_DEV, "sample input failed\r\n");
+            DBG_PRINTF("[DEBUG] loop sample input failed at tow_ms=%lu\r\n",
+                       (unsigned long)tow_ms);
             continue;
         }
 
         tow_ms++;
 
+        DBG_PRINTF("[DEBUG] tow_ms=%lu\r\n", (unsigned long)tow_ms);
+
         for (int i = 0; i < track_count; i++) {
             gnss_measurement_t meas;
 
             if (!tracks[i].locked) {
+                DBG_PRINTF("[DEBUG] track %d not locked, skipping\r\n", i);
                 continue;
             }
 
             tracking_step(raw_1ms, samples_per_ms, fs_hz, &tracks[i]);
+
+            DBG_PRINTF("[DEBUG] track=%d PRN=%d prompt_i=%ld prompt_q=%ld cn0_like=%ld carrier_hz=%ld code_phase=%d\r\n",
+                       i,
+                       tracks[i].prn,
+                       (long)tracks[i].prompt_i,
+                       (long)tracks[i].prompt_q,
+                       (long)tracks[i].cn0_like,
+                       (long)tracks[i].carrier_hz,
+                       tracks[i].code_phase);
+
             build_measurement(tow_ms, &tracks[i], &meas);
             uart_send_measurement(&meas);
         }
