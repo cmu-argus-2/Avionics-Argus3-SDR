@@ -17,6 +17,7 @@ The design focuses on:
 ---
 
 ## 🧠 System Pipeline
+```bash
 Raw Samples (iq16_t)
 |
 Mix Down (gnss_sat16)
@@ -32,6 +33,7 @@ Tracking State (track_state_t)
 Measurement Extraction (gnss_measurement_t)
 |
 UART Output
+```
 
 ---
 
@@ -122,10 +124,6 @@ UART Output
 ### Streaming Architecture
 - Continuous data flow
 - Low latency processing
-
-### Modular Design
-- Each stage is independently testable
-- Enables future FPGA / ASIC mapping
 
 ---
 
