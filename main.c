@@ -1,29 +1,3 @@
-
-// #include <eff.h>
-// #include <stdio.h>
-// #include "gnss_types.h"
-
-// int main() {
-//     int i = 0;
-
-//     eff_pinmux_set(PINMUX_11, PINMUX_GPIO);
-//     eff_gpio_dir_set(GPIO_11, GPIO_PIN_2, EFF_GPIO_OUT);
-
-//     while (1) {
-//         printf("Energy is everything! %i\r\n", i);
-
-//         printf("Try GNSS type library: %x\r\n", gnss_sat16(0x0000FFFF));
-
-//         if (i % 2)
-//             eff_gpio_set(GPIO_11, GPIO_PIN_2);
-//         else
-//             eff_gpio_clear(GPIO_11, GPIO_PIN_2);
-
-//         i++;
-//         sleep(1);
-//     }
-// }
-
 #include <eff.h>
 #include <eff/drivers/uart.h>
 #include <stdio.h>
@@ -41,14 +15,12 @@
 #define ACQ_DOPPLER_MAX_HZ   (10000)
 #define ACQ_DOPPLER_STEP_HZ  (500)
 #define ACQ_METRIC_THRESHOLD 1000000
-#define Q15_SHIFT            15
 
 #define NCO_LUT_BITS         8
 #define NCO_LUT_SIZE         (1 << NCO_LUT_BITS)
 #define NCO_LUT_MASK         (NCO_LUT_SIZE - 1)
 
-/* Q15 cosine/sine LUT, 256 points over 1 turn.
-   Generated offline; no libm needed at runtime. */
+/* Q15 cosine/sine LUT, 256 samples over 2*pi */
 static const int16_t cos_lut_q15[NCO_LUT_SIZE] = {
     32767,32757,32728,32678,32609,32521,32412,32285,
     32137,31971,31785,31580,31356,31113,30852,30571,
@@ -149,7 +121,7 @@ static void uart_send_measurement(const gnss_measurement_t *m) {
     eff_uart_puts(UART_DEV, buf);
 }
 
-/* ---------------- local code placeholders ---------------- */
+/* ---------------- local code helpers ---------------- */
 
 static void generate_ca_code_prn(int prn, int8_t code[GPS_L1_CA_CHIPS]) {
     uint16_t lfsr = (uint16_t)(0x3FFu ^ (uint16_t)(prn * 37));
@@ -167,15 +139,11 @@ static void make_oversampled_code(const int8_t ca_code[GPS_L1_CA_CHIPS],
 {
     for (int n = 0; n < samples_per_ms; n++) {
         int chip = ((n * GPS_L1_CA_CHIPS) / samples_per_ms + code_phase_offset) % GPS_L1_CA_CHIPS;
-        if (chip < 0) chip += GPS_L1_CA_CHIPS;
+        if (chip < 0) {
+            chip += GPS_L1_CA_CHIPS;
+        }
         dst[n] = ca_code[chip];
     }
-}
-
-static uint32_t nco_phase_step_hz(int32_t f_hz, uint32_t fs_hz)
-{
-    int64_t num = ((int64_t)f_hz << 32);
-    return (uint32_t)(num / (int64_t)fs_hz);
 }
 
 /* ---------------- Efficient kernels ---------------- */
@@ -197,8 +165,8 @@ void mix_down_nco_kernel(const iq16_t *in,
         int32_t nr = cos_lut_q15[idx];
         int32_t nq = -sin_lut_q15[idx];   /* exp(-j*phase) */
 
-        int32_t orr = (ir * nr - iq * nq) >> Q15_SHIFT;
-        int32_t orq = (ir * nq + iq * nr) >> Q15_SHIFT;
+        int32_t orr = gnss_q15_mul(ir, nr) - gnss_q15_mul(iq, nq);
+        int32_t orq = gnss_q15_mul(ir, nq) + gnss_q15_mul(iq, nr);
 
         out[k].i = gnss_sat16(orr);
         out[k].q = gnss_sat16(orq);
@@ -214,12 +182,15 @@ void correlate_1ms_kernel(const iq16_t *samples,
                           int32_t *acc_i,
                           int32_t *acc_q)
 {
-    int32_t si = 0, sq = 0;
+    int32_t si = 0;
+    int32_t sq = 0;
+
     for (int k = 0; k < n; k++) {
         int32_t c = (int32_t)ca_oversampled[k];
         si += samples[k].i * c;
         sq += samples[k].q * c;
     }
+
     *acc_i = si;
     *acc_q = sq;
 }
@@ -271,11 +242,12 @@ static acq_result_t acquire_one_prn(const iq16_t *raw_1ms,
     generate_ca_code_prn(prn, ca_code);
 
     for (int dop = ACQ_DOPPLER_MIN_HZ; dop <= ACQ_DOPPLER_MAX_HZ; dop += ACQ_DOPPLER_STEP_HZ) {
-        uint32_t phase_step = nco_phase_step_hz(dop, fs_hz);
+        uint32_t phase_step = gnss_phase_step_from_hz(dop, fs_hz);
         mix_down_nco_kernel(raw_1ms, mixed, samples_per_ms, 0u, phase_step);
 
         for (int code_phase = 0; code_phase < GPS_L1_CA_CHIPS; code_phase++) {
-            int32_t ci, cq;
+            int32_t ci;
+            int32_t cq;
             int32_t metric;
 
             make_oversampled_code(ca_code, local_code, samples_per_ms, code_phase);
@@ -311,8 +283,8 @@ static void tracking_step(const iq16_t *raw_1ms,
     generate_ca_code_prn(st->prn, ca_code);
 
     {
-        uint32_t phase0 = ((uint32_t)st->carrier_phase_q16) << 16;
-        uint32_t phase_step = nco_phase_step_hz(st->carrier_hz, fs_hz);
+        uint32_t phase0 = gnss_phase_q16_to_q32(st->carrier_phase_q16);
+        uint32_t phase_step = gnss_phase_step_from_hz(st->carrier_hz, fs_hz);
         mix_down_nco_kernel(raw_1ms, mixed, samples_per_ms, phase0, phase_step);
     }
 
@@ -343,8 +315,8 @@ static void tracking_step(const iq16_t *raw_1ms,
         st->carrier_hz -= 1;
     }
 
-    st->carrier_phase_q16 += (st->carrier_hz << 4);
-    st->code_rate_q16 = (1023 << 16);
+    st->carrier_phase_q16 += gnss_carrier_phase_advance_q16(st->carrier_hz);
+    st->code_rate_q16 = gnss_q16_from_int(1023);
 }
 
 /* ---------------- measurement packaging ---------------- */
@@ -355,7 +327,7 @@ static void build_measurement(uint32_t tow_ms,
 {
     m->tow_ms = tow_ms;
     m->prn = (uint8_t)st->prn;
-    m->code_phase_q16 = st->code_phase << 16;
+    m->code_phase_q16 = gnss_q16_from_int(st->code_phase);
     m->doppler_hz = st->carrier_hz;
     m->carrier_phase_q16 = st->carrier_phase_q16;
     m->prompt_i = st->prompt_i;
@@ -366,7 +338,8 @@ static void build_measurement(uint32_t tow_ms,
 
 /* ---------------- sample source hook ---------------- */
 
-static int read_gnss_samples_1ms(iq16_t *dst, int samples_per_ms) {
+static int read_gnss_samples_1ms(iq16_t *dst, int samples_per_ms)
+{
     for (int i = 0; i < samples_per_ms; i++) {
         dst[i].i = 0;
         dst[i].q = 0;
@@ -376,7 +349,8 @@ static int read_gnss_samples_1ms(iq16_t *dst, int samples_per_ms) {
 
 /* ---------------- main ---------------- */
 
-int main(void) {
+int main(void)
+{
     const uint32_t fs_hz = 5000000u;
     const int samples_per_ms = (int)(fs_hz / 1000u);
 
