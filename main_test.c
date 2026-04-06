@@ -357,25 +357,25 @@ int main(void)
     srand(TEST_SEED);
     memset(tracks, 0, sizeof(tracks));
 
-    DBG_PRINTF("[TB] GNSS testbench start\n");
-    DBG_PRINTF("[TB] fs_hz=%lu samples_per_ms=%d seed=%d iterations=%d\n",
+    DBG_PRINTF("[TB] GNSS testbench start\r\n");
+    DBG_PRINTF("[TB] fs_hz=%lu samples_per_ms=%d seed=%d iterations=%d\r\n",
                (unsigned long)fs_hz, samples_per_ms, TEST_SEED, TEST_ITERATIONS);
 
     if (samples_per_ms > MAX_SAMPLES_MS) {
-        DBG_PRINTF("[TB] ERROR: samples_per_ms exceeds MAX_SAMPLES_MS\n");
+        DBG_PRINTF("[TB] ERROR: samples_per_ms exceeds MAX_SAMPLES_MS\r\n");
         return -1;
     }
 
     if (!read_gnss_samples_1ms(raw_1ms, samples_per_ms)) {
-        DBG_PRINTF("[TB] ERROR: initial sample generation failed\n");
+        DBG_PRINTF("[TB] ERROR: initial sample generation failed\r\n");
         return -1;
     }
 
-    DBG_PRINTF("[TB] Starting acquisition...\n");
+    DBG_PRINTF("[TB] Starting acquisition...\r\n");
     for (int prn = 1; prn <= MAX_PRNS_TO_SEARCH && track_count < MAX_TRACKS; prn++) {
         acq_result_t acq = acquire_one_prn(raw_1ms, samples_per_ms, fs_hz, prn);
 
-        DBG_PRINTF("[TB] ACQ PRN=%d found=%d metric=%ld doppler=%ld code_phase=%d\n",
+        DBG_PRINTF("[TB] ACQ PRN=%d found=%d metric=%ld doppler=%ld code_phase=%d\r\n",
                    prn,
                    acq.found ? 1 : 0,
                    (long)acq.metric,
@@ -390,7 +390,7 @@ int main(void)
             tracks[track_count].carrier_phase_q16 = 0;
             tracks[track_count].code_rate_q16 = 0;
 
-            DBG_PRINTF("[TB] LOCK slot=%d PRN=%d doppler=%ld code_phase=%d metric=%ld\n",
+            DBG_PRINTF("[TB] LOCK slot=%d PRN=%d doppler=%ld code_phase=%d metric=%ld\r\n",
                        track_count,
                        acq.prn,
                        (long)acq.doppler_hz,
@@ -401,28 +401,28 @@ int main(void)
         }
     }
 
-    DBG_PRINTF("[TB] Acquisition complete, track_count=%d\n", track_count);
+    DBG_PRINTF("[TB] Acquisition complete, track_count=%d\r\n", track_count);
 
     for (int iter = 0; iter < TEST_ITERATIONS; iter++) {
         if (!read_gnss_samples_1ms(raw_1ms, samples_per_ms)) {
-            DBG_PRINTF("[TB] ERROR: sample generation failed at iter=%d\n", iter);
+            DBG_PRINTF("[TB] ERROR: sample generation failed at iter=%d\r\n", iter);
             continue;
         }
 
         tow_ms++;
-        DBG_PRINTF("[TB] ---- ITER %d / TOW %lu ----\n", iter, (unsigned long)tow_ms);
+        DBG_PRINTF("[TB] ---- ITER %d / TOW %lu ----\r\n", iter, (unsigned long)tow_ms);
 
         for (int i = 0; i < track_count; i++) {
             gnss_measurement_t meas;
 
             if (!tracks[i].locked) {
-                DBG_PRINTF("[TB] track %d not locked, skipping\n", i);
+                DBG_PRINTF("[TB] track %d not locked, skipping\r\n", i);
                 continue;
             }
 
             tracking_step(raw_1ms, samples_per_ms, fs_hz, &tracks[i]);
 
-            DBG_PRINTF("[TB] TRACK=%d PRN=%d prompt_i=%ld prompt_q=%ld cn0_like=%ld carrier_hz=%ld code_phase=%d\n",
+            DBG_PRINTF("[TB] TRACK=%d PRN=%d prompt_i=%ld prompt_q=%ld cn0_like=%ld carrier_hz=%ld code_phase=%d\r\n",
                        i,
                        tracks[i].prn,
                        (long)tracks[i].prompt_i,
@@ -436,6 +436,6 @@ int main(void)
         }
     }
 
-    DBG_PRINTF("[TB] GNSS testbench done\n");
+    DBG_PRINTF("[TB] GNSS testbench done\r\n");
     return 0;
 }
