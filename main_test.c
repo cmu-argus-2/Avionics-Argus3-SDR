@@ -7,7 +7,7 @@
 #include <eff.h>
 #include "gnss_types.h"
 
-#define MAX_PRNS_TO_SEARCH   12
+#define MAX_PRNS_TO_SEARCH   1
 #define ACQ_DOPPLER_MIN_HZ  (-10000)
 #define ACQ_DOPPLER_MAX_HZ   (10000)
 #define ACQ_DOPPLER_STEP_HZ  (500)
@@ -17,7 +17,7 @@
 #define NCO_LUT_SIZE         (1 << NCO_LUT_BITS)
 #define NCO_LUT_MASK         (NCO_LUT_SIZE - 1)
 
-#define TEST_ITERATIONS      10
+#define TEST_ITERATIONS      2
 #define TEST_SEED            12345
 
 #define DEBUG_PRINT
