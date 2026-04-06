@@ -27,6 +27,9 @@
 #define DBG_PRINTF(...)
 #endif
 
+#define TS_SEC(us_)   ((unsigned long)((us_) / 1000000ULL))
+#define TS_USEC(us_)  ((unsigned long)((us_) % 1000000ULL))
+
 typedef struct {
     uint64_t acq_prns_tested;
     uint64_t acq_doppler_bins;
@@ -130,36 +133,16 @@ static uint64_t now_us(void)
     return uptime_us();
 }
 
-static double us_to_s(uint64_t us)
+static uint64_t rel_us(void)
 {
-    return (double)us / 1000000.0;
-}
-
-static double rel_s(void)
-{
-    return us_to_s(now_us() - g_stats.t_prog_start_us);
-}
-
-/*
- * Replace these with the real EVK AON output controls.
- * They are left as stubs so the code builds even before the GPIO hookup is known.
- */
-static void aon4_set(int value)
-{
-    (void)value;
-    /* TODO: replace with real AON4 output write */
-}
-
-static void aon5_set(int value)
-{
-    (void)value;
-    /* TODO: replace with real AON5 output write */
+    return now_us() - g_stats.t_prog_start_us;
 }
 
 static void print_measurement(const gnss_measurement_t *m)
 {
-    printf("[T=%10.6f s] [MEAS] %lu,%u,%ld,%ld,%ld,%ld,%ld,%ld,%u\r\n",
-           rel_s(),
+    uint64_t t = rel_us();
+    printf("[T=%lu.%06lu s] [MEAS] %lu,%u,%ld,%ld,%ld,%ld,%ld,%ld,%u\r\n",
+           TS_SEC(t), TS_USEC(t),
            (unsigned long)m->tow_ms,
            (unsigned)m->prn,
            (long)m->code_phase_q16,
@@ -405,31 +388,48 @@ static int read_gnss_samples_1ms(iq16_t *dst, int samples_per_ms)
 
 static void print_evaluation(uint32_t fs_hz, int samples_per_ms, int track_count)
 {
-    double total_time_s = us_to_s(g_stats.t_prog_end_us   - g_stats.t_prog_start_us);
-    double acq_time_s   = us_to_s(g_stats.t_acq_end_us    - g_stats.t_acq_start_us);
-    double trk_time_s   = us_to_s(g_stats.t_track_end_us  - g_stats.t_track_start_us);
+    uint64_t total_time_us = g_stats.t_prog_end_us  - g_stats.t_prog_start_us;
+    uint64_t acq_time_us   = g_stats.t_acq_end_us   - g_stats.t_acq_start_us;
+    uint64_t trk_time_us   = g_stats.t_track_end_us - g_stats.t_track_start_us;
 
-    double input_bandwidth_Bps = (double)fs_hz * 4.0;
-    double input_bandwidth_MBps = input_bandwidth_Bps / 1.0e6;
+    uint64_t input_bandwidth_Bps  = (uint64_t)fs_hz * 4ULL;
+    uint64_t input_bandwidth_kBps = input_bandwidth_Bps / 1000ULL;
 
-    double sample_throughput_sps = (total_time_s > 0.0)
-        ? ((double)g_stats.input_samples_generated / total_time_s) : 0.0;
+    uint64_t sample_throughput_sps = 0ULL;
+    uint64_t acq_trials_per_s = 0ULL;
+    uint64_t corr_contribs_total = 0ULL;
+    uint64_t corr_contribs_per_s = 0ULL;
 
-    double acq_trials_per_s = (acq_time_s > 0.0)
-        ? ((double)g_stats.acq_trials / acq_time_s) : 0.0;
+    uint64_t est_mix_ops = 0ULL;
+    uint64_t est_corr1_ops = 0ULL;
+    uint64_t est_corr3_ops = 0ULL;
+    uint64_t est_total_ops = 0ULL;
+    uint64_t est_ops_per_s = 0ULL;
 
-    double corr_contribs_total =
-        (double)g_stats.corr1_samples + (double)g_stats.corr3_samples;
+    if (total_time_us > 0ULL) {
+        sample_throughput_sps =
+            (g_stats.input_samples_generated * 1000000ULL) / total_time_us;
+    }
 
-    double corr_contribs_per_s = (total_time_s > 0.0)
-        ? (corr_contribs_total / total_time_s) : 0.0;
+    if (acq_time_us > 0ULL) {
+        acq_trials_per_s =
+            (g_stats.acq_trials * 1000000ULL) / acq_time_us;
+    }
 
-    double est_mix_ops   = (double)g_stats.mix_samples * 10.0;
-    double est_corr1_ops = (double)g_stats.corr1_samples * 4.0;
-    double est_corr3_ops = ((double)g_stats.corr3_samples / 3.0) * 12.0;
-    double est_total_ops = est_mix_ops + est_corr1_ops + est_corr3_ops;
-    double est_ops_per_s = (total_time_s > 0.0)
-        ? (est_total_ops / total_time_s) : 0.0;
+    corr_contribs_total = g_stats.corr1_samples + g_stats.corr3_samples;
+    if (total_time_us > 0ULL) {
+        corr_contribs_per_s =
+            (corr_contribs_total * 1000000ULL) / total_time_us;
+    }
+
+    est_mix_ops   = g_stats.mix_samples * 10ULL;
+    est_corr1_ops = g_stats.corr1_samples * 4ULL;
+    est_corr3_ops = (g_stats.corr3_samples / 3ULL) * 12ULL;
+    est_total_ops = est_mix_ops + est_corr1_ops + est_corr3_ops;
+
+    if (total_time_us > 0ULL) {
+        est_ops_per_s = (est_total_ops * 1000000ULL) / total_time_us;
+    }
 
     printf("\r\n================ GNSS PERFORMANCE EVALUATION ================\r\n");
     printf("CONFIG\r\n");
@@ -442,12 +442,18 @@ static void print_evaluation(uint32_t fs_hz, int samples_per_ms, int track_count
     printf("  tracking correlator bank     : 3\r\n");
 
     printf("\r\nTIMING\r\n");
-    printf("  total_runtime_s              : %.6f\r\n", total_time_s);
-    printf("  acquisition_runtime_s        : %.6f\r\n", acq_time_s);
-    printf("  tracking_runtime_s           : %.6f\r\n", trk_time_s);
-    printf("  total_runtime_us             : %llu\r\n", (unsigned long long)(g_stats.t_prog_end_us - g_stats.t_prog_start_us));
-    printf("  acquisition_runtime_us       : %llu\r\n", (unsigned long long)(g_stats.t_acq_end_us - g_stats.t_acq_start_us));
-    printf("  tracking_runtime_us          : %llu\r\n", (unsigned long long)(g_stats.t_track_end_us - g_stats.t_track_start_us));
+    printf("  total_runtime_us             : %llu\r\n", (unsigned long long)total_time_us);
+    printf("  acquisition_runtime_us       : %llu\r\n", (unsigned long long)acq_time_us);
+    printf("  tracking_runtime_us          : %llu\r\n", (unsigned long long)trk_time_us);
+    printf("  total_runtime_s              : %llu.%06llu\r\n",
+           (unsigned long long)(total_time_us / 1000000ULL),
+           (unsigned long long)(total_time_us % 1000000ULL));
+    printf("  acquisition_runtime_s        : %llu.%06llu\r\n",
+           (unsigned long long)(acq_time_us / 1000000ULL),
+           (unsigned long long)(acq_time_us % 1000000ULL));
+    printf("  tracking_runtime_s           : %llu.%06llu\r\n",
+           (unsigned long long)(trk_time_us / 1000000ULL),
+           (unsigned long long)(trk_time_us % 1000000ULL));
 
     printf("\r\nWORK COUNTS\r\n");
     printf("  input_samples_generated      : %llu\r\n", (unsigned long long)g_stats.input_samples_generated);
@@ -464,21 +470,22 @@ static void print_evaluation(uint32_t fs_hz, int samples_per_ms, int track_count
     printf("  measurements_emitted         : %llu\r\n", (unsigned long long)g_stats.measurements_emitted);
 
     printf("\r\nTHROUGHPUT / BANDWIDTH\r\n");
-    printf("  input_sample_throughput_sps  : %.3f\r\n", sample_throughput_sps);
-    printf("  acquisition_trials_per_s     : %.3f\r\n", acq_trials_per_s);
-    printf("  corr_contribs_per_s          : %.3f\r\n", corr_contribs_per_s);
-    printf("  input_bandwidth_Bps          : %.3f\r\n", input_bandwidth_Bps);
-    printf("  input_bandwidth_MBps         : %.3f\r\n", input_bandwidth_MBps);
+    printf("  input_sample_throughput_sps  : %llu\r\n", (unsigned long long)sample_throughput_sps);
+    printf("  acquisition_trials_per_s     : %llu\r\n", (unsigned long long)acq_trials_per_s);
+    printf("  corr_contribs_per_s          : %llu\r\n", (unsigned long long)corr_contribs_per_s);
+    printf("  input_bandwidth_Bps          : %llu\r\n", (unsigned long long)input_bandwidth_Bps);
+    printf("  input_bandwidth_kBps         : %llu\r\n", (unsigned long long)input_bandwidth_kBps);
 
     printf("\r\nOPS ESTIMATION\r\n");
-    printf("  est_mix_ops                  : %.3f\r\n", est_mix_ops);
-    printf("  est_corr1_ops                : %.3f\r\n", est_corr1_ops);
-    printf("  est_corr3_ops                : %.3f\r\n", est_corr3_ops);
-    printf("  est_total_ops                : %.3f\r\n", est_total_ops);
-    printf("  est_ops_per_s                : %.3f\r\n", est_ops_per_s);
+    printf("  est_mix_ops                  : %llu\r\n", (unsigned long long)est_mix_ops);
+    printf("  est_corr1_ops                : %llu\r\n", (unsigned long long)est_corr1_ops);
+    printf("  est_corr3_ops                : %llu\r\n", (unsigned long long)est_corr3_ops);
+    printf("  est_total_ops                : %llu\r\n", (unsigned long long)est_total_ops);
+    printf("  est_ops_per_s                : %llu\r\n", (unsigned long long)est_ops_per_s);
 
     printf("\r\nPOWER / ENERGY\r\n");
-    printf("  Use EVK CSV with AON4/AON5 markers for true energy integration.\r\n");
+    printf("  Use EVK CSV timestamps to integrate power offline.\r\n");
+    printf("  Suggested rails: power_var(mW) for compute, power_sys(mW) for whole-board.\r\n");
     printf("============================================================\r\n");
 }
 
@@ -499,33 +506,44 @@ int main(void)
     srand(TEST_SEED);
     memset(tracks, 0, sizeof(tracks));
 
-    aon4_set(0);
-    aon5_set(0);
-
-    printf("[T=%10.6f s] [TB] GNSS testbench start\r\n", rel_s());
-    printf("[T=%10.6f s] [TB] fs_hz=%lu samples_per_ms=%d seed=%d iterations=%d\r\n",
-           rel_s(), (unsigned long)fs_hz, samples_per_ms, TEST_SEED, TEST_ITERATIONS);
+    {
+        uint64_t t = rel_us();
+        printf("[T=%lu.%06lu s] [TB] GNSS testbench start\r\n", TS_SEC(t), TS_USEC(t));
+    }
+    {
+        uint64_t t = rel_us();
+        printf("[T=%lu.%06lu s] [TB] fs_hz=%lu samples_per_ms=%d seed=%d iterations=%d\r\n",
+               TS_SEC(t), TS_USEC(t),
+               (unsigned long)fs_hz, samples_per_ms, TEST_SEED, TEST_ITERATIONS);
+    }
 
     if (samples_per_ms > MAX_SAMPLES_MS) {
-        printf("[T=%10.6f s] [ERR] samples_per_ms exceeds MAX_SAMPLES_MS\r\n", rel_s());
+        uint64_t t = rel_us();
+        printf("[T=%lu.%06lu s] [ERR] samples_per_ms exceeds MAX_SAMPLES_MS\r\n",
+               TS_SEC(t), TS_USEC(t));
         return -1;
     }
 
     if (!read_gnss_samples_1ms(raw_1ms, samples_per_ms)) {
-        printf("[T=%10.6f s] [ERR] initial sample generation failed\r\n", rel_s());
+        uint64_t t = rel_us();
+        printf("[T=%lu.%06lu s] [ERR] initial sample generation failed\r\n",
+               TS_SEC(t), TS_USEC(t));
         return -1;
     }
 
     g_stats.t_acq_start_us = now_us();
-    aon4_set(1);
-    aon5_set(0);
-    printf("[T=%10.6f s] [ACQ] Starting acquisition\r\n", rel_s());
+    {
+        uint64_t t = rel_us();
+        printf("[T=%lu.%06lu s] [ACQ] Starting acquisition\r\n",
+               TS_SEC(t), TS_USEC(t));
+    }
 
     for (int prn = 1; prn <= MAX_PRNS_TO_SEARCH && track_count < MAX_TRACKS; prn++) {
         acq_result_t acq = acquire_one_prn(raw_1ms, samples_per_ms, fs_hz, prn);
+        uint64_t t = rel_us();
 
-        printf("[T=%10.6f s] [ACQ] PRN=%d found=%d metric=%ld doppler=%ld code_phase=%d\r\n",
-               rel_s(),
+        printf("[T=%lu.%06lu s] [ACQ] PRN=%d found=%d metric=%ld doppler=%ld code_phase=%d\r\n",
+               TS_SEC(t), TS_USEC(t),
                prn,
                acq.found ? 1 : 0,
                (long)acq.metric,
@@ -540,8 +558,9 @@ int main(void)
             tracks[track_count].carrier_phase_q16 = 0;
             tracks[track_count].code_rate_q16 = 0;
 
-            printf("[T=%10.6f s] [LOCK] slot=%d PRN=%d doppler=%ld code_phase=%d metric=%ld\r\n",
-                   rel_s(),
+            t = rel_us();
+            printf("[T=%lu.%06lu s] [LOCK] slot=%d PRN=%d doppler=%ld code_phase=%d metric=%ld\r\n",
+                   TS_SEC(t), TS_USEC(t),
                    track_count,
                    acq.prn,
                    (long)acq.doppler_hz,
@@ -552,55 +571,74 @@ int main(void)
         }
     }
 
-    aon4_set(0);
     g_stats.t_acq_end_us = now_us();
-    printf("[T=%10.6f s] [ACQ] Acquisition complete, track_count=%d\r\n", rel_s(), track_count);
+    {
+        uint64_t t = rel_us();
+        printf("[T=%lu.%06lu s] [ACQ] Acquisition complete, track_count=%d\r\n",
+               TS_SEC(t), TS_USEC(t), track_count);
+    }
 
     g_stats.t_track_start_us = now_us();
-    aon5_set(1);
-    printf("[T=%10.6f s] [TRK] Starting tracking loop\r\n", rel_s());
+    {
+        uint64_t t = rel_us();
+        printf("[T=%lu.%06lu s] [TRK] Starting tracking loop\r\n",
+               TS_SEC(t), TS_USEC(t));
+    }
 
     for (int iter = 0; iter < TEST_ITERATIONS; iter++) {
         if (!read_gnss_samples_1ms(raw_1ms, samples_per_ms)) {
-            printf("[T=%10.6f s] [ERR] sample generation failed at iter=%d\r\n", rel_s(), iter);
+            uint64_t t = rel_us();
+            printf("[T=%lu.%06lu s] [ERR] sample generation failed at iter=%d\r\n",
+                   TS_SEC(t), TS_USEC(t), iter);
             continue;
         }
 
         tow_ms++;
-        printf("[T=%10.6f s] [TRK] ITER=%d TOW=%lu\r\n",
-               rel_s(), iter, (unsigned long)tow_ms);
+        {
+            uint64_t t = rel_us();
+            printf("[T=%lu.%06lu s] [TRK] ITER=%d TOW=%lu\r\n",
+                   TS_SEC(t), TS_USEC(t), iter, (unsigned long)tow_ms);
+        }
 
         for (int i = 0; i < track_count; i++) {
             gnss_measurement_t meas;
 
             if (!tracks[i].locked) {
-                printf("[T=%10.6f s] [TRK] track %d not locked, skipping\r\n", rel_s(), i);
+                uint64_t t = rel_us();
+                printf("[T=%lu.%06lu s] [TRK] track %d not locked, skipping\r\n",
+                       TS_SEC(t), TS_USEC(t), i);
                 continue;
             }
 
             tracking_step(raw_1ms, samples_per_ms, fs_hz, &tracks[i]);
 
-            printf("[T=%10.6f s] [TRK] track=%d PRN=%d prompt_i=%ld prompt_q=%ld cn0_like=%ld carrier_hz=%ld code_phase=%d\r\n",
-                   rel_s(),
-                   i,
-                   tracks[i].prn,
-                   (long)tracks[i].prompt_i,
-                   (long)tracks[i].prompt_q,
-                   (long)tracks[i].cn0_like,
-                   (long)tracks[i].carrier_hz,
-                   tracks[i].code_phase);
+            {
+                uint64_t t = rel_us();
+                printf("[T=%lu.%06lu s] [TRK] track=%d PRN=%d prompt_i=%ld prompt_q=%ld cn0_like=%ld carrier_hz=%ld code_phase=%d\r\n",
+                       TS_SEC(t), TS_USEC(t),
+                       i,
+                       tracks[i].prn,
+                       (long)tracks[i].prompt_i,
+                       (long)tracks[i].prompt_q,
+                       (long)tracks[i].cn0_like,
+                       (long)tracks[i].carrier_hz,
+                       tracks[i].code_phase);
+            }
 
             build_measurement(tow_ms, &tracks[i], &meas);
             print_measurement(&meas);
         }
     }
 
-    aon5_set(0);
     g_stats.t_track_end_us = now_us();
     g_stats.t_prog_end_us = now_us();
 
-    printf("[T=%10.6f s] [TB] GNSS testbench done\r\n", rel_s());
-    print_evaluation(fs_hz, samples_per_ms, track_count);
+    {
+        uint64_t t = rel_us();
+        printf("[T=%lu.%06lu s] [TB] GNSS testbench done\r\n",
+               TS_SEC(t), TS_USEC(t));
+    }
 
+    print_evaluation(fs_hz, samples_per_ms, track_count);
     return 0;
 }
