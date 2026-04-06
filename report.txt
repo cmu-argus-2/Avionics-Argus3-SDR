@@ -1,0 +1,7 @@
+Runtime:            247.3 s
+Total ops:          8.41e8
+Throughput:         4.34 MOPS
+Average power:      1.15 mW
+Total energy:       0.285 J
+Efficiency:         2.95 GOPS/J
+Power efficiency:   3.77 GOPS/W
