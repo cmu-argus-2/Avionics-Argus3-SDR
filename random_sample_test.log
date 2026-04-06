@@ -1,0 +1,55 @@
+5000000 samples_per_ms=5000 seed=12345 iterations=2
+[T=0.025877 s] [ACQ] Starting acquisition
+[T=192.1582810 s] [ACQ] PRN=1 found=1 metric=2147478884 doppler=10000 code_phase=623
+[T=192.1590822 s] [LOCK] slot=0 PRN=1 doppler=10000 code_phase=623 metric=2147n complete, track_count=1
+[T=192.1604754 s] [TRK] Starting tracking loop
+[T=192.1623656 s] [TRK] ITER=0 T
+                                [T=192.1645297 s] [TRK] track=0 cn0_like=23156 carrier_hz=9999 code_phase=624
+[T=192.1656399 s] [MEAS] 1,1,40894464,9999,159984,-26639,-79190,23156,1
+[T=192.1678903 s] [TRK] ITER=1 TOW=2
+[T=192.1700526 s] [TRK] track=0 PRN=1 prompt_i=-54248 prompt_q=-49077 cn0_like=14362 carrier_hz=9998 code_phase=625
+[T=192.1711617 s] [MEAS] 2,1,40960000,9998,319952,-54248,-49077,14362,1
+[T=192.1718451 s] [TB] GNSS testbench done
+
+=================
+CONFIG
+  fs_hz                         : 5000000                                                                                                
+  samples_per_ms               : 5000                                                                                                    
+  test_iterations              : 2                                                                                                       
+  random_seed                  : 12345                                                                                                   
+  track_count                  : 1                                                                                                       
+  acquisitelator bank     : 3                                                                                                            
+                                                                                                                                         
+TIMING                                                                                                                                   
+  total_runtime_us             : 193718416                                                                                               
+  acquisition_runtime_us       : 193572973                                                                                               
+  tracking_runtime_us          : 113667                                                                                                  
+  total_runtime_s              : 192.1718416                                                                                             
+  acquisition_runtime_s s           : 0.113667                                                                                           
+                                                                                                                                         
+WORK COUNTS                                                                                                                              
+  input_samples_generated      : 15000                                                                                                   
+  acquisition_prns_tested      : 1                                                                                                       
+  acquisition_doppler_bins     : 41                                                                                                      
+  acquisition_code_phases      : 41943                                                                                                   
+  acquisition_trials           : 4194corr1_calls                  : 41943                                                                
+  corr3_calls                  : 2                                                                                                       
+  mix_samples                  : 215000                                                                                                  
+  corr1_samples                : 209715000                                                                                               
+  corr3_samples                : 30000                                                                                                   
+  measurements_emitted         ple_throughput_sps  : 76                                                                                  
+  acquisition_trials_per_s     : 216                                                                                                     
+  corr_contribs_per_s          : 1082730                                                                                                 
+  input_bandwidth_Bps          : 20000000                                                                                                
+  input_bandwidth_kBps         : 20000                                                                                                   
+                                                                                                                                         
+OPS ESTIMATION                                                                                                                           
+  est_mix_ops                  : 838860000                                                                                               
+  est_corr3_ops                : 119976                                                                                                  
+  est_total_ops                : 841129976                                                                                               
+  est_ops_per_s                : 4342022                                                                                                 
+                                                                                                                                         
+POWER / ENERGY                                                                                                                           
+  Use EVK CSV timestamps to integrate power offline.                                                                                     
+  Suggest_sys(mW) for whole-board.                                                                                                       
+============================================================     
