@@ -100,7 +100,7 @@ static const int16_t sin_lut_q15[NCO_LUT_SIZE] = {
 /* ---------------- output helper ---------------- */
 
 static void print_measurement(const gnss_measurement_t *m) {
-    printf("MEAS,%lu,%u,%ld,%ld,%ld,%ld,%ld,%ld,%u\n",
+    printf("MEAS,%lu,%u,%ld,%ld,%ld,%ld,%ld,%ld,%u\r\n",
            (unsigned long)m->tow_ms,
            (unsigned)m->prn,
            (long)m->code_phase_q16,
