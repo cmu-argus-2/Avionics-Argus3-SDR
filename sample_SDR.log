@@ -1,0 +1,33 @@
+[ACQ] PRN=1 found=1 metric=2147390153 doppler=6000 code_phase=158
+[T=182.808903 s] [MEAS] 1,1,10289152,6001,96016,-6428,32167,-12436,1                      
+[T=182.835691 s] [MEAS] 2,1,10223616,6000,192016,13276,-MANCE EVALUATION ================ 
+CONFIG                                                                                    
+  fs_hz                         : 5000000                                                 
+  parsed_iq_count              : 7500
+  samples_per_ms               : 5000
+  test_iterations              : 2
+  track_count                
+                               tracking correlator bank     : 3
+
+TIMING
+  total_runtime_us             : 182842480
+  acquisition_runtime_us       : 182781769
+  tracking_runtime_us          : 53521                                                                                                   
+                                                                                                                                         
+WORK COUNTS                                                                                                                              
+  input_samples_generated      : 15000                                                                                                   
+ mix_samples                  : 215000                                                                                                   
+  corr1_samples                : 209715000                                                                                               
+  corr3_samples                : 30000                                                                                                   
+  measurements_emitted         : 2                                                                                                       
+                                                                                                                                         
+THROUGHPUT / BANDWIDTH                                                                                                                   
+  input_sample_throughput_sps  : 82                                                                                                      
+  acquiribs_per_s          : 1147134                                                                                                     
+  input_bandwidth_Bps          : 20000000                                                                                                
+  input_bandwidth_kBps         : 20000                                                                                                   
+                                                                                                                                         
+OPS ESTIMATION                                                                                                                           
+  est_total_ops                : 841129976                                                                                               
+  est_ops_per_s                : 4600298                                                                                                 
+==================    
