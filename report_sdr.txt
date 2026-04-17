@@ -1,0 +1,26 @@
+Input source: parsed SDR IQ samples
+parsed_iq_count:        7500
+samples_per_ms:         5000
+test_iterations:        2
+
+Runtime:
+  total_runtime:        182.842480 s
+  acquisition_runtime:  182.781769 s
+  tracking_runtime:     0.053521 s
+
+Work / throughput:
+  total_ops:            841,129,976
+  throughput:           4,600,298 ops/s
+  sample_throughput:    82 samples/s
+
+Energy / efficiency (compute rail, power_var):
+  total_energy:         0.1932 J
+  avg_power:            1.057 mW
+  ops_per_joule:        4.35e9 ops/J
+  ops_per_watt:         4.35e9 ops/W
+
+Energy / efficiency (whole board, power_sys):
+  total_energy:         14.7446 J
+  avg_power:            80.648 mW
+  ops_per_joule:        5.705e7 ops/J
+  ops_per_watt:         5.705e7 ops/W
