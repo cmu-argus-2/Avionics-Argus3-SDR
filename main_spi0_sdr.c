@@ -31,6 +31,13 @@
 #define TS_SEC(us_)   ((unsigned long)((us_) / 1000000ULL))
 #define TS_USEC(us_)  ((unsigned long)((us_) % 1000000ULL))
 
+#define DEBUG_PRINT
+#ifdef DEBUG_PRINT
+#define DBG_PRINTF(...) printf(__VA_ARGS__)
+#else
+#define DBG_PRINTF(...)
+#endif
+
 typedef struct {
     uint64_t acq_prns_tested;
     uint64_t acq_doppler_bins;
@@ -162,7 +169,7 @@ static uint64_t rel_us(void)
 static void print_measurement(const gnss_measurement_t *m)
 {
     uint64_t t = rel_us();
-    printf("[T=%lu.%06lu s] [MEAS] %lu,%u,%ld,%ld,%ld,%ld,%ld,%ld,%u\r\n",
+    DBG_PRINTF("[T=%lu.%06lu s] [MEAS] %lu,%u,%ld,%ld,%ld,%ld,%ld,%ld,%u\r\n",
            TS_SEC(t), TS_USEC(t),
            (unsigned long)m->tow_ms,
            (unsigned)m->prn,
@@ -219,20 +226,20 @@ static int read_gnss_samples_1ms(iq16_t *dst, int samples_per_ms, uint32_t expec
     iq_spi_frame_t frame;
 
     if (samples_per_ms != (int)FRAME_SAMPLES) {
-        printf("[ERR] samples_per_ms=%d but SPI frame holds %u samples\r\n",
+        DBG_PRINTF("[DEBUG] samples_per_ms=%d but SPI frame holds %u samples\r\n",
                samples_per_ms, (unsigned)FRAME_SAMPLES);
         return 0;
     }
 
     if (!spi0_read_frame(&frame)) {
-        printf("[ERR] SPI frame read failed\r\n");
+        DBG_PRINTF("[DEBUG] SPI frame read failed\r\n");
         return 0;
     }
 
     if (frame.magic != FRAME_MAGIC ||
         frame.version != FRAME_VERSION ||
         frame.payload_bytes != FRAME_DATA_BYTES) {
-        printf("[ERR] bad SPI frame hdr: magic=0x%08lx ver=%u bytes=%u\r\n",
+        DBG_PRINTF("[DEBUG] bad SPI frame hdr: magic=0x%08lx ver=%u bytes=%u\r\n",
                (unsigned long)frame.magic,
                (unsigned)frame.version,
                (unsigned)frame.payload_bytes);
@@ -240,14 +247,14 @@ static int read_gnss_samples_1ms(iq16_t *dst, int samples_per_ms, uint32_t expec
     }
 
     if (frame.sample_rate_hz != expected_fs_hz) {
-        printf("[ERR] frame fs_hz=%lu expected=%lu\r\n",
+        DBG_PRINTF("[DEBUG] frame fs_hz=%lu expected=%lu\r\n",
                (unsigned long)frame.sample_rate_hz,
                (unsigned long)expected_fs_hz);
         return 0;
     }
 
     if (g_have_last_seq && frame.sequence != (g_last_seq + 1u)) {
-        printf("[WARN] SPI seq jump prev=%lu curr=%lu\r\n",
+        DBG_PRINTF("[DEBUG] SPI seq jump prev=%lu curr=%lu\r\n",
                (unsigned long)g_last_seq,
                (unsigned long)frame.sequence);
     }
@@ -580,17 +587,17 @@ int main(void)
     }
 
     if (samples_per_ms > MAX_SAMPLES_MS) {
-        printf("[ERR] samples_per_ms exceeds MAX_SAMPLES_MS\r\n");
+        DBG_PRINTF("[ERR] samples_per_ms exceeds MAX_SAMPLES_MS\r\n");
         return -1;
     }
 
     if (spi0_init_for_iq()) {
-        printf("[ERR] failed to init SPI0 raw-IQ input\r\n");
+        DBG_PRINTF("[ERR] failed to init SPI0 raw-IQ input\r\n");
         return -1;
     }
 
     if (!read_gnss_samples_1ms(raw_1ms, samples_per_ms, fs_hz)) {
-        printf("[ERR] failed to read initial SPI IQ frame\r\n");
+        DBG_PRINTF("[ERR] failed to read initial SPI IQ frame\r\n");
         return -1;
     }
 
