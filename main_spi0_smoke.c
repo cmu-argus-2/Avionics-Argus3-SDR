@@ -57,6 +57,7 @@ static int spi0_read_frame(iq_spi_frame_t *frame)
 
 int main(void)
 {
+    DBG_PRINTF("Hello from spi0 smoke test\r\n");
     iq_spi_frame_t frame;
 
     DBG_PRINTF("[DEBUG] spi0 smoke start\r\n");
