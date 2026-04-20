@@ -1,4 +1,5 @@
 export EFFCC_DIR="/home/argus/effcc/"
+rm -rf ../../build
 mkdir ../../build
 cd ../../build
 cmake -G Ninja .. -DEFF_STDIO_PORT=3
