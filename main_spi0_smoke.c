@@ -188,6 +188,15 @@ static int spi0_init(void)
     return 0;
 }
 
+/* Counters exposed to the outer loop for periodic summary prints.
+ * Declared before spi0_poll_byte so the poll routine can bump
+ * g_overruns without a forward declaration. We deliberately do NOT
+ * print anything from inside the hot poll loop — every dbg() is a
+ * synchronous UART transmit and at high SPI rates we don't have the
+ * time. */
+static volatile uint32_t g_overruns = 0;
+static volatile uint32_t g_midframe_err = 0;
+
 /* Poll the RX FIFO for one byte.
  *
  * `strict_overrun`:
@@ -229,14 +238,6 @@ static int spi0_poll_byte(uint8_t *b, uint32_t budget, int strict_overrun)
     }
     return -1;
 }
-
-/* Counters exposed to the outer loop for periodic summary prints.
- * We deliberately DO NOT print anything from inside the hot poll loop —
- * every dbg() is a synchronous UART transmit and at 20 MHz SPI we
- * don't have the time. UART saturation was also garbling the existing
- * heartbeat lines (characters dropped mid-string). */
-static volatile uint32_t g_overruns = 0;
-static volatile uint32_t g_midframe_err = 0;
 
 /* Read one IQ frame from the SPI bus. Returns:
  *    1  - full frame received and copied into *frame
