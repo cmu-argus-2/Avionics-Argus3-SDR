@@ -9,40 +9,43 @@
 
 /* ---------------- UART (debug output) ----------------
  *
- * IMPORTANT: per the Efficient docs, only UART_0 (the boot UART) is
- * usable without configuration. Every other UART must be both
- * eff_uart_init()'d AND have its pinmux set to PINMUX_UART before
- * anything you write to it can reach the wire.
+ * Board port layout (per user):
+ *   /dev/ttyACM0 -> flashing (eff-flash)
+ *   /dev/ttyACM1 -> power monitor
+ *   /dev/ttyACM2 -> monitoring (this is what minicom should attach to)
  *
- * Your run_simple.sh builds with -DEFF_STDIO_PORT=3, which routes
- * printf() to UART_3, but nothing in the code ever inits UART_3 or
- * pinmuxes PINMUX_3. That is why you see absolutely nothing in minicom.
- * main.c only appears to work because it pushes its visible output via
- * eff_uart_puts(UART_4, ...) after explicitly configuring UART_4, which
- * is what /dev/ttyACM2 is actually wired to on your setup.
+ * /dev/ttyACM2 is physically wired to UART_4 on the Efficient chip.
+ * Per the UART + pinmux docs, any UART other than the boot UART must be
+ * BOTH eff_uart_init()'d AND have its pin group switched to UART mode
+ * via eff_pinmux_set(..., PINMUX_UART) before anything you write can
+ * reach the pins.
  *
- * We mirror that exact known-good path here and use eff_uart_puts()
- * directly instead of relying on stdio at all.
+ * run_simple.sh now builds with -DEFF_STDIO_PORT=4, so printf() is also
+ * routed to UART_4. We use BOTH printf() and eff_uart_puts() for the
+ * early banner so that whichever path the runtime prefers, at least one
+ * message reaches minicom. This is the same strategy main.c uses.
  */
 #define UART_DEV        UART_4
 #define UART_PINMUX     PINMUX_4
 
 /* ---------------- SPI -----------------
  *
- * WARNING: the Efficient SDK SPI driver (eff_spi_xfer) is MASTER ONLY.
- * There is no documented slave-mode configuration; the driver generates
- * SCK/CS and clocks tx_data out / rx_data in itself. Your Pi bridge
- * (/dev/spidev0.0) is also configured as master, so once this board
- * runs, both sides will be driving SCK/CS → bus contention, and no
- * valid frames will be received.
+ * Pin group selection, per the pinmux PDF:
+ *   - Only GPIO_0..GPIO_5 support alternate peripheral functions, so
+ *     PINMUX_0..PINMUX_5 are the only valid pin-group handles. PINMUX_0
+ *     for SPI_0 is fine. (The SDK SPI example itself pairs SPI_3 with
+ *     PINMUX_3, confirming the index-matches-peripheral convention.)
+ *   - PINMUX_SPI = "SPI only" mode for that pin group, which is what we
+ *     want — no I2C/UART/RTC sharing on pin group 0.
+ *   - Pin group 0 (SPI) and pin group 4 (UART debug) are independent,
+ *     so configuring SPI_0 cannot disturb the UART_4 debug output.
  *
- * We keep the SPI code here so you can at least see the smoke test
- * start printing now, but the architecture needs to change before any
- * frame will actually arrive: either flip roles (Pi becomes slave,
- * Efficient master — Linux spidev supports slave mode but it's
- * awkward), use a different link (UART/I2C/DMA-fed GPIO), or check the
- * actual eff/drivers/spi.h header on your dev machine for any
- * undocumented slave config fields.
+ * WARNING: eff_spi_xfer is master-only in the published SDK. The Pi
+ * bridge (/dev/spidev0.0) is also master, so once this board runs, both
+ * sides will be driving SCK/CS -> bus contention, no valid frames. The
+ * smoke test intentionally still runs so we can at least confirm the
+ * CPU + UART are alive; the link direction needs to be redesigned
+ * before any real IQ frame will arrive.
  */
 #define SPI_DEV         SPI_0
 #define SPI_PINMUX      PINMUX_0
@@ -97,12 +100,21 @@ static int spi0_init(void)
     spi_cfg.xfer_mode = SPI_XFER_READ_ONLY;
     spi_cfg.bus_size  = SPI_BUS_SINGLE;
 
-    /* Pinmux first so pins are in SPI mode before the controller
-     * samples / drives them. */
-    if (eff_pinmux_set(SPI_PINMUX, SPI_PINMUX_CFG)) {
+    /* IMPORTANT: order matches the canonical SPI example in the
+     * Efficient docs (and the UART bring-up in main.c):
+     *
+     *     eff_spi_init(SPI_3, &spi_cfg);
+     *     eff_pinmux_set(PINMUX_3, PINMUX_QSPI);
+     *
+     * i.e. configure the controller FIRST, then flip the pin group into
+     * SPI mode. The previous version of this file did pinmux first,
+     * which deviates from the docs and may have been contributing to
+     * the "no output at all on minicom" symptom if the SPI bring-up
+     * faulted before the first heartbeat could print. */
+    if (eff_spi_init(SPI_DEV, &spi_cfg)) {
         return -1;
     }
-    if (eff_spi_init(SPI_DEV, &spi_cfg)) {
+    if (eff_pinmux_set(SPI_PINMUX, SPI_PINMUX_CFG)) {
         return -2;
     }
     return 0;
@@ -123,6 +135,14 @@ static int spi0_read_frame(iq_spi_frame_t *frame)
 
 int main(void)
 {
+    /* printf() before any explicit init, mirroring main.c. With
+     * -DEFF_STDIO_PORT=4 (see run_simple.sh) the stdio runtime will
+     * route this to UART_4 and — empirically from main.c — handle
+     * whatever implicit bring-up stdio needs. If the earlier smoke test
+     * produced NO output at all, this line will at least tell us
+     * whether the stdio path is working. */
+    printf("\r\n[DEBUG] spi0 smoke: entering main (stdio path)\r\n");
+
     /* Bring up UART_4 FIRST, before anything else could try to talk. */
     if (uart_debug_init()) {
         /* Nothing we can do if this fails — there's no other output
@@ -130,7 +150,9 @@ int main(void)
     }
 
     /* Immediate sanity print so we can see the board is alive before
-     * any peripheral configuration touches pins. */
+     * any peripheral configuration touches pins. This uses the explicit
+     * eff_uart_puts() path, which is what main.c actually relies on for
+     * its visible output. */
     eff_uart_puts(UART_DEV, "\r\n=== spi0 smoke: UART_4 alive ===\r\n");
 
     iq_spi_frame_t frame;
