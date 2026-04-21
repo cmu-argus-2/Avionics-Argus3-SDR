@@ -1,0 +1,6 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# PDFs (reference docs, not source)
+*.pdf

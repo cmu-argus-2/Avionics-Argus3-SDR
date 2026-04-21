@@ -7,6 +7,14 @@
 #include <eff/drivers/spi.h>
 #include <eff/drivers/uart.h>
 
+/* Direct register access to the ATCSPI200 controller behind SPI_0.
+ * The SDK's eff_spi_cfg_t does not expose a master/slave field, but
+ * the underlying IP has TRANSFMT.SLVMODE (bit 2) which flips the
+ * controller into slave mode. We poke that bit manually after
+ * eff_spi_init() has set up everything else. See
+ * /home/argus/effcc/sdk/include/eff/atc/atcspi200.h lines 126-128. */
+#include <eff/atc/atcspi200.h>
+
 /* ---------------- UART (debug output) ----------------
  *
  * Board port layout (per user):
@@ -41,23 +49,16 @@
  *     which is the pin group normally shared with UART_4. Since our
  *     debug UART is UART_3 (pin group PINMUX_3), UART_4 is unused, so
  *     we can safely hand all four pins of pin group 4 to SPI.
- *   - PINMUX_SPI = "SPI only" mode for that pin group. This is the
- *     right enum value because we do NOT want UART_4 multiplexed on
- *     the same group (PINMUX_SPI_UART would keep UART_4 wired up too).
- *   - Pin group 3 (UART debug, UART_3) and pin group 4 (SPI_0) are
- *     independent, so configuring SPI_0 cannot disturb UART_3 output.
- *   - Only GPIO_0..GPIO_5 support alternate functions; PINMUX_4 is
- *     well within that range.
+ *   - PINMUX_SPI = "SPI only" mode for that pin group.
  *
- * Link direction (per user): the Raspberry Pi is the SPI master and
- * clocks IQ frames *into* the Efficient board; the Efficient board is
- * the receiver. The published SDK's eff_spi_xfer is documented as
- * master-only, so driving it with SPI_XFER_READ_ONLY here will also
- * generate SCK/CS from the Efficient side and collide with the Pi.
- * That still needs to be resolved (slave-mode config on Efficient, or
- * flipping master/slave roles) before real frames will land; the smoke
- * test is only here to confirm CPU + UART are alive and that the SPI
- * bring-up call itself doesn't hang.
+ * Link direction: the Raspberry Pi is the SPI master and clocks IQ
+ * frames *into* the Efficient board; the Efficient board is the
+ * receiver. Since the SDK's eff_spi_cfg_t cannot express master-vs-
+ * slave, we let eff_spi_init() configure the controller as master
+ * (the default), then manually set TRANSFMT.SLVMODE=1 on the raw
+ * ATCSPI200 register block to switch to slave mode. In slave mode SCK
+ * and CS are inputs driven by the Pi, and our MOSI becomes the data-in
+ * line. No bus contention — only one device drives the clock.
  */
 #define SPI_DEV         SPI_0
 #define SPI_PINMUX      PINMUX_4
@@ -111,33 +112,54 @@ static int spi0_init(void)
     eff_spi_cfg_t spi_cfg = EFF_SPI_DEFAULTS;
     spi_cfg.xfer_mode = SPI_XFER_READ_ONLY;
     spi_cfg.bus_size  = SPI_BUS_SINGLE;
+    /* clk_div is irrelevant in slave mode — the Pi master drives SCK.
+     * We leave it at the default from EFF_SPI_DEFAULTS. */
 
-    /* IMPORTANT: order matches the canonical SPI example in the
-     * Efficient docs (and the UART bring-up in main.c):
-     *
-     *     eff_spi_init(SPI_3, &spi_cfg);
-     *     eff_pinmux_set(PINMUX_3, PINMUX_QSPI);
-     *
-     * i.e. configure the controller FIRST, then flip the pin group into
-     * SPI mode. The previous version of this file did pinmux first,
-     * which deviates from the docs and may have been contributing to
-     * the "no output at all on minicom" symptom if the SPI bring-up
-     * faulted before the first heartbeat could print. */
+    /* Init order matches the canonical SPI example in the Efficient
+     * docs (controller first, then pinmux). */
     if (eff_spi_init(SPI_DEV, &spi_cfg)) {
         return -1;
     }
     if (eff_pinmux_set(SPI_PINMUX, SPI_PINMUX_CFG)) {
         return -2;
     }
+
+    /* Flip the controller into SLAVE mode by setting TRANSFMT.SLVMODE.
+     *
+     * The SDK wrapper has already written TRANSFMT with everything
+     * else (data length, CPOL/CPHA, etc.) at defaults and left SLVMODE
+     * at 0 (master). We OR in the SLVMODE bit as the very last step of
+     * bring-up, before any data transfer is requested, so the hardware
+     * sees a coherent slave-mode config when the Pi first asserts CS.
+     *
+     * SPI_0 is a handle to eff_spi_t, whose base_address points at the
+     * ATCSPI200 register block (see sdk/drivers/spi/spi.c). */
+    {
+        ATCSPI200_RegDef *atc = (ATCSPI200_RegDef *)SPI_0->base_address;
+        atc->TRANSFMT |= ATCSPI200_TRANSFMT_SLVMODE_MASK;
+    }
+
     return 0;
 }
 
 static int spi0_read_frame(iq_spi_frame_t *frame)
 {
     memset(frame, 0, sizeof(*frame));
+
+    /* Bracket the xfer with debug prints so we can tell from minicom
+     * whether eff_spi_xfer is blocking forever vs. returning an error.
+     * Without these prints we can't distinguish "the driver hung on the
+     * first call" from "everything is fine, just no frames yet". */
+    dbg("[DEBUG] spi_xfer: enter (rx %u bytes)\r\n",
+        (unsigned)sizeof(*frame));
+
     /* eff_spi_xfer returns 0 on success, nonzero on error. */
-    if (eff_spi_xfer(SPI_DEV, 0, 0, NULL, 0,
-                     (uint8_t *)frame, (uint32_t)sizeof(*frame))) {
+    int8_t rc = eff_spi_xfer(SPI_DEV, 0, 0, NULL, 0,
+                             (uint8_t *)frame, (uint32_t)sizeof(*frame));
+
+    dbg("[DEBUG] spi_xfer: exit rc=%d\r\n", (int)rc);
+
+    if (rc) {
         return 0;
     }
     return 1;
@@ -165,7 +187,12 @@ int main(void)
      * eff_uart_puts() path on UART_3 (the monitoring UART). */
     eff_uart_puts(UART_DEV, "\r\n=== spi0 smoke: UART_3 alive ===\r\n");
 
-    iq_spi_frame_t frame;
+    /* IMPORTANT: the IQ frame is 2068 bytes. Allocating it on main()'s
+     * stack is risky on this core — a stack overflow during SPI xfer
+     * would look exactly like a hang (which is one of the candidate
+     * causes for why we only see "iter=1" today). Move it to static
+     * storage so we can rule that out as a confound. */
+    static iq_spi_frame_t frame;
     int rc;
 
     dbg("[DEBUG] spi0 smoke start\r\n");
@@ -179,23 +206,30 @@ int main(void)
         dbg("[DEBUG] spi0 init ok, waiting for frames\r\n");
     }
 
-    dbg("[DEBUG] NOTE: eff_spi_xfer is master-only per SDK docs;\r\n"
-        "        with the Pi also as master you have bus contention.\r\n"
-        "        Expect garbage frames or hangs until this is resolved.\r\n");
+    dbg("[DEBUG] SPI_0 running in SLAVE mode (TRANSFMT.SLVMODE=1).\r\n"
+        "        Waiting for Pi master to clock in frames on MOSI.\r\n");
 
     uint32_t iter = 0;
     while (1) {
-        /* Heartbeat every ~64 iterations so you can see the CPU is
-         * alive even if eff_spi_xfer never returns valid data. */
-        if ((iter++ & 0x3Fu) == 0u) {
-            dbg("[DEBUG] spi0 loop iter=%lu\r\n", (unsigned long)iter);
-        }
+        iter++;
+
+        /* Heartbeat on EVERY iteration during diagnosis. Previously
+         * this only fired every 64 iterations, which made it
+         * impossible to tell whether the loop had advanced at all past
+         * a blocking eff_spi_xfer. Once we know the SPI path is
+         * behaving, we can throttle this back. */
+        dbg("[DEBUG] spi0 loop iter=%lu\r\n", (unsigned long)iter);
 
         if (rc) {
-            /* Don't hammer the broken driver; just loop so the
-             * heartbeat keeps coming out. */
+            /* SPI init failed — don't hammer the broken driver, just
+             * keep the heartbeat going so we know the CPU is alive. */
             continue;
         }
+
+        /* Paranoia: if the xfer call is blocking, the line above
+         * ("iter=N") will be the last thing minicom ever sees. That's
+         * the diagnostic signal we're looking for. */
+        dbg("[DEBUG] about to call spi0_read_frame\r\n");
 
         if (!spi0_read_frame(&frame)) {
             dbg("[DEBUG] spi0 read failed\r\n");

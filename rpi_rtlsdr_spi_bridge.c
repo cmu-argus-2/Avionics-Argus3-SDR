@@ -1,3 +1,37 @@
+/*
+ * rpi_rtlsdr_spi_bridge.c
+ *
+ * RTL-SDR -> SPI bridge on a Raspberry Pi, running as SPI MASTER.
+ *
+ * The Pi clocks SCK/CS and shifts IQ frames out on MOSI. The Efficient
+ * board runs its SPI controller in SLAVE mode (via a direct register
+ * poke of ATCSPI200_TRANSFMT.SLVMODE in main_spi0_smoke.c, since the
+ * SDK's eff_spi_cfg_t doesn't expose the slave bit). No device-tree
+ * overlays on the Pi, no slave chardev — plain /dev/spidev0.0 master
+ * mode, the way you've always been running it.
+ *
+ * Wiring (unchanged):
+ *   Pi SPI0_SCLK (GPIO 11, pin 23)  -> Efficient SPI0 SCK   (Pi drives)
+ *   Pi SPI0_CE0  (GPIO 8,  pin 24)  -> Efficient SPI0 CS    (Pi drives)
+ *   Pi SPI0_MOSI (GPIO 10, pin 19)  -> Efficient SPI0 MOSI  (Pi sends IQ)
+ *   Pi SPI0_MISO (GPIO 9,  pin 21)  <- Efficient SPI0 MISO  (unused by us)
+ *   Common ground.
+ *
+ * Build:
+ *     gcc -O2 -Wall -Wextra -o rpi_bridge rpi_rtlsdr_spi_bridge.c \
+ *         -lrtlsdr -lpthread
+ *
+ * Run:
+ *     sudo ./rpi_bridge /dev/spidev0.0 1575420000 1024000 20000000 0
+ *
+ *     argv[1] : SPI chardev
+ *     argv[2] : RTL-SDR center frequency Hz
+ *     argv[3] : RTL-SDR sample rate Hz
+ *     argv[4] : SPI clock Hz (Pi-side; Efficient slave tolerates a few
+ *               MHz reliably, start around 5–20 MHz and tune)
+ *     argv[5] : RTL-SDR tuner gain in tenths of dB (0 = auto)
+ */
+
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -287,7 +321,7 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr,
-            "Streaming RTL-SDR -> SPI\n"
+            "Streaming RTL-SDR -> SPI (Pi master, Efficient slave)\n"
             "  SPI device     : %s\n"
             "  Center freq Hz : %u\n"
             "  Sample rate Hz : %u\n"
