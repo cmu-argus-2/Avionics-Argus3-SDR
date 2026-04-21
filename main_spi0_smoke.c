@@ -188,11 +188,12 @@ static int spi0_init(void)
     return 0;
 }
 
-/* Counter exposed to the outer loop for periodic summary prints.
+/* Counters exposed to the outer loop for periodic summary prints.
  * We deliberately do NOT print anything from inside the hot poll loop —
  * every dbg() is a synchronous UART transmit and at high SPI rates we
  * don't have the time. */
 static volatile uint32_t g_midframe_err = 0;
+static volatile uint32_t g_bytes_seen   = 0;  /* total bytes drained from RX FIFO */
 
 /* Poll the RX FIFO for one byte.
  *
@@ -218,6 +219,7 @@ static int spi0_poll_byte(uint8_t *b, uint32_t budget)
             /* DATAMERGE=0, so low byte of DATA is the next received
              * byte on MOSI. Upper bytes are undefined; ignore them. */
             *b = (uint8_t)(atc->DATA & 0xFFu);
+            g_bytes_seen++;
             return 0;
         }
     }
@@ -236,7 +238,10 @@ static int spi0_poll_byte(uint8_t *b, uint32_t budget)
  * SPI and caused the exact overruns we were trying to diagnose. */
 static int spi0_read_frame(iq_spi_frame_t *frame)
 {
-    const uint32_t SEARCH_BUDGET = 10000000u; /* ~one heartbeat */
+    /* Much smaller than before so heartbeats fire frequently even
+     * when the Pi is silent — we'd rather get 10 heartbeats/sec that
+     * say "wcnt=X, bytes=Y" than wait seconds between them. */
+    const uint32_t SEARCH_BUDGET =   500000u;
     const uint32_t INBAND_BUDGET =   200000u; /* tight mid-frame deadline */
 
     ATCSPI200_RegDef *atc = (ATCSPI200_RegDef *)SPI_0->base_address;
@@ -305,7 +310,7 @@ int main(void)
     static iq_spi_frame_t frame;
     int rc;
 
-    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v4 no-intrst-read]\r\n");
+    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v5 fast-heartbeat]\r\n");
 
     rc = spi0_init();
     if (rc) {
@@ -335,12 +340,13 @@ int main(void)
             wcnt = (atc->SLVDATACNT & ATCSPI200_SLVDATACNT_WCNT_MASK)
                    >> ATCSPI200_SLVDATACNT_WCNT_OFFSET;
         }
-        dbg("[DEBUG] iter=%lu ok=%lu bad=%lu mid=%lu wcnt=%lu\r\n",
+        dbg("[DEBUG] iter=%lu ok=%lu bad=%lu mid=%lu wcnt=%lu bytes=%lu\r\n",
             (unsigned long)iter,
             (unsigned long)frames_ok,
             (unsigned long)frames_bad,
             (unsigned long)g_midframe_err,
-            (unsigned long)wcnt);
+            (unsigned long)wcnt,
+            (unsigned long)g_bytes_seen);
 
         if (rc) {
             /* SPI init failed — keep heartbeat, don't touch driver. */
