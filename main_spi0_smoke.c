@@ -14,41 +14,53 @@
  *   /dev/ttyACM1 -> power monitor
  *   /dev/ttyACM2 -> monitoring (this is what minicom should attach to)
  *
- * /dev/ttyACM2 is physically wired to UART_4 on the Efficient chip.
+ * /dev/ttyACM2 is physically wired to UART_3 on the Efficient chip.
+ * This was confirmed empirically: with -DEFF_STDIO_PORT=3 the printf()
+ * banner at the top of main() appears in minicom; with =4 it does not.
+ * Earlier comments in this file (and in main.c) claimed UART_4 was the
+ * monitoring UART — that was wrong, and is why nothing ever showed up
+ * when we pushed output through eff_uart_puts(UART_4, ...).
+ *
  * Per the UART + pinmux docs, any UART other than the boot UART must be
  * BOTH eff_uart_init()'d AND have its pin group switched to UART mode
- * via eff_pinmux_set(..., PINMUX_UART) before anything you write can
- * reach the pins.
+ * via eff_pinmux_set(PINMUX_3, PINMUX_UART) before anything you write
+ * can reach the pins. We do both below in uart_debug_init().
  *
- * run_simple.sh now builds with -DEFF_STDIO_PORT=4, so printf() is also
- * routed to UART_4. We use BOTH printf() and eff_uart_puts() for the
- * early banner so that whichever path the runtime prefers, at least one
- * message reaches minicom. This is the same strategy main.c uses.
+ * run_simple.sh therefore builds with -DEFF_STDIO_PORT=3 so that
+ * printf() and our explicit eff_uart_puts(UART_3, ...) both hit the
+ * same physical wire, and we use both paths as a belt-and-suspenders
+ * early sanity check.
  */
-#define UART_DEV        UART_4
-#define UART_PINMUX     PINMUX_4
+#define UART_DEV        UART_3
+#define UART_PINMUX     PINMUX_3
 
 /* ---------------- SPI -----------------
  *
- * Pin group selection, per the pinmux PDF:
- *   - Only GPIO_0..GPIO_5 support alternate peripheral functions, so
- *     PINMUX_0..PINMUX_5 are the only valid pin-group handles. PINMUX_0
- *     for SPI_0 is fine. (The SDK SPI example itself pairs SPI_3 with
- *     PINMUX_3, confirming the index-matches-peripheral convention.)
- *   - PINMUX_SPI = "SPI only" mode for that pin group, which is what we
- *     want — no I2C/UART/RTC sharing on pin group 0.
- *   - Pin group 0 (SPI) and pin group 4 (UART debug) are independent,
- *     so configuring SPI_0 cannot disturb the UART_4 debug output.
+ * Pin group selection, per the pinmux PDF and board wiring (per user):
+ *   - SPI_0's physical pads on this board sit in pin group PINMUX_4,
+ *     which is the pin group normally shared with UART_4. Since our
+ *     debug UART is UART_3 (pin group PINMUX_3), UART_4 is unused, so
+ *     we can safely hand all four pins of pin group 4 to SPI.
+ *   - PINMUX_SPI = "SPI only" mode for that pin group. This is the
+ *     right enum value because we do NOT want UART_4 multiplexed on
+ *     the same group (PINMUX_SPI_UART would keep UART_4 wired up too).
+ *   - Pin group 3 (UART debug, UART_3) and pin group 4 (SPI_0) are
+ *     independent, so configuring SPI_0 cannot disturb UART_3 output.
+ *   - Only GPIO_0..GPIO_5 support alternate functions; PINMUX_4 is
+ *     well within that range.
  *
- * WARNING: eff_spi_xfer is master-only in the published SDK. The Pi
- * bridge (/dev/spidev0.0) is also master, so once this board runs, both
- * sides will be driving SCK/CS -> bus contention, no valid frames. The
- * smoke test intentionally still runs so we can at least confirm the
- * CPU + UART are alive; the link direction needs to be redesigned
- * before any real IQ frame will arrive.
+ * Link direction (per user): the Raspberry Pi is the SPI master and
+ * clocks IQ frames *into* the Efficient board; the Efficient board is
+ * the receiver. The published SDK's eff_spi_xfer is documented as
+ * master-only, so driving it with SPI_XFER_READ_ONLY here will also
+ * generate SCK/CS from the Efficient side and collide with the Pi.
+ * That still needs to be resolved (slave-mode config on Efficient, or
+ * flipping master/slave roles) before real frames will land; the smoke
+ * test is only here to confirm CPU + UART are alive and that the SPI
+ * bring-up call itself doesn't hang.
  */
 #define SPI_DEV         SPI_0
-#define SPI_PINMUX      PINMUX_0
+#define SPI_PINMUX      PINMUX_4
 #define SPI_PINMUX_CFG  PINMUX_SPI
 
 #define FRAME_MAGIC       0x49515130u
@@ -80,7 +92,7 @@ static int uart_debug_init(void)
     return 0;
 }
 
-/* snprintf into a local buffer and shove it out UART_4. Avoids any
+/* snprintf into a local buffer and shove it out UART_3. Avoids any
  * dependency on the stdio port the CMake build picked. */
 static void dbg(const char *fmt, ...)
 {
@@ -135,15 +147,14 @@ static int spi0_read_frame(iq_spi_frame_t *frame)
 
 int main(void)
 {
-    /* printf() before any explicit init, mirroring main.c. With
-     * -DEFF_STDIO_PORT=4 (see run_simple.sh) the stdio runtime will
-     * route this to UART_4 and — empirically from main.c — handle
-     * whatever implicit bring-up stdio needs. If the earlier smoke test
-     * produced NO output at all, this line will at least tell us
-     * whether the stdio path is working. */
+    /* printf() before any explicit init. With -DEFF_STDIO_PORT=3 (see
+     * run_simple.sh) the stdio runtime routes this to UART_3, which is
+     * physically wired to /dev/ttyACM2 (monitoring). This line is the
+     * first thing the user will actually see in minicom and confirms
+     * the board booted and reached main(). */
     printf("\r\n[DEBUG] spi0 smoke: entering main (stdio path)\r\n");
 
-    /* Bring up UART_4 FIRST, before anything else could try to talk. */
+    /* Bring up UART_3 FIRST, before anything else could try to talk. */
     if (uart_debug_init()) {
         /* Nothing we can do if this fails — there's no other output
          * path. Fall through silently so the CPU doesn't hang here. */
@@ -151,9 +162,8 @@ int main(void)
 
     /* Immediate sanity print so we can see the board is alive before
      * any peripheral configuration touches pins. This uses the explicit
-     * eff_uart_puts() path, which is what main.c actually relies on for
-     * its visible output. */
-    eff_uart_puts(UART_DEV, "\r\n=== spi0 smoke: UART_4 alive ===\r\n");
+     * eff_uart_puts() path on UART_3 (the monitoring UART). */
+    eff_uart_puts(UART_DEV, "\r\n=== spi0 smoke: UART_3 alive ===\r\n");
 
     iq_spi_frame_t frame;
     int rc;
