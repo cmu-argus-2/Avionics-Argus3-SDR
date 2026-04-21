@@ -188,47 +188,32 @@ static int spi0_init(void)
     return 0;
 }
 
-/* Counters exposed to the outer loop for periodic summary prints.
- * Declared before spi0_poll_byte so the poll routine can bump
- * g_overruns without a forward declaration. We deliberately do NOT
- * print anything from inside the hot poll loop — every dbg() is a
- * synchronous UART transmit and at high SPI rates we don't have the
- * time. */
-static volatile uint32_t g_overruns = 0;
+/* Counter exposed to the outer loop for periodic summary prints.
+ * We deliberately do NOT print anything from inside the hot poll loop —
+ * every dbg() is a synchronous UART transmit and at high SPI rates we
+ * don't have the time. */
 static volatile uint32_t g_midframe_err = 0;
 
 /* Poll the RX FIFO for one byte.
  *
- * `strict_overrun`:
- *    true  - treat RXFIFOORINT as fatal and return -2 immediately.
- *            Used inside a frame, where dropped bytes desync us.
- *    false - treat RXFIFOORINT as informational: bump the overrun
- *            counter, clear the flag, and keep polling. Used during
- *            magic search, where losing bytes is harmless because
- *            we're just scanning a stream for a 4-byte pattern.
+ * IMPORTANT: we do NOT read INTRST here. INTRST is declared `__O`
+ * (write-only) in the SDK header, and reads of write-only registers
+ * return undefined values on this IP — which caused the false-positive
+ * overrun storm in earlier builds (`ovr = 5M/heartbeat` with `ok = 0`).
+ * Overrun detection is handled implicitly instead: if we miss bytes
+ * mid-frame, the per-byte INBAND_BUDGET will time out and the caller
+ * will abort + resync. During magic search, dropped bytes are harmless
+ * because we're scanning a stream for a 4-byte pattern that will
+ * appear again on the next frame.
  *
  * Returns:
  *    0  - got a byte, written to *b
- *   -1  - timeout: no byte arrived within `budget` polls
- *   -2  - RX FIFO overrun (only when strict_overrun=true) */
-static int spi0_poll_byte(uint8_t *b, uint32_t budget, int strict_overrun)
+ *   -1  - timeout: no byte arrived within `budget` polls */
+static int spi0_poll_byte(uint8_t *b, uint32_t budget)
 {
     ATCSPI200_RegDef *atc = (ATCSPI200_RegDef *)SPI_0->base_address;
 
     for (uint32_t i = 0; i < budget; i++) {
-        /* Overrun detection. RXFIFOORINT is W1C. */
-        if (atc->INTRST & ATCSPI200_INTRST_RXFIFOORINT_MASK) {
-            atc->INTRST = ATCSPI200_INTRST_RXFIFOORINT_MASK;
-            g_overruns++;
-            if (strict_overrun) {
-                return -2;
-            }
-            /* Non-strict: data was dropped but we're still scanning
-             * for magic. Clearing the flag is enough; don't flush
-             * the FIFO here because bytes may already be queued and
-             * flushing would drop them too. Fall through to the
-             * empty check. */
-        }
         if (!(atc->STATUS & ATCSPI200_STATUS_RXEMPTY_MASK)) {
             /* DATAMERGE=0, so low byte of DATA is the next received
              * byte on MOSI. Upper bytes are undefined; ignore them. */
@@ -263,14 +248,9 @@ static int spi0_read_frame(iq_spi_frame_t *frame)
 
     while (remaining > 0) {
         uint8_t b;
-        /* Non-strict: overruns while scanning for magic are OK. */
-        int rc = spi0_poll_byte(&b, remaining, 0);
+        int rc = spi0_poll_byte(&b, remaining);
         if (rc == -1) {
-            /* No magic in this window. Let outer loop heartbeat. */
-            return 0;
-        }
-        /* rc == -2 can't happen in non-strict mode; kept for safety. */
-        if (rc < 0) {
+            /* No byte in this window. Let outer loop heartbeat. */
             return 0;
         }
         if (remaining > 1) remaining--;
@@ -286,9 +266,11 @@ static int spi0_read_frame(iq_spi_frame_t *frame)
             dst[3] = MAGIC_B3;
 
             for (size_t n = 4; n < sizeof(*frame); n++) {
-                /* Strict: mid-frame overrun is fatal, we've lost
-                 * position and the remaining bytes are garbage. */
-                rc = spi0_poll_byte(&dst[n], INBAND_BUDGET, 1);
+                /* Tight per-byte deadline: once locked on magic, every
+                 * subsequent byte should arrive within one master clock
+                 * period. A timeout here means the Pi stopped or we
+                 * got desynced. */
+                rc = spi0_poll_byte(&dst[n], INBAND_BUDGET);
                 if (rc) {
                     g_midframe_err++;
                     atc->CTRL |= ATCSPI200_CTRL_RXFIFORST_MASK;
@@ -323,7 +305,7 @@ int main(void)
     static iq_spi_frame_t frame;
     int rc;
 
-    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v3 non-strict-ovr]\r\n");
+    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v4 no-intrst-read]\r\n");
 
     rc = spi0_init();
     if (rc) {
@@ -340,17 +322,25 @@ int main(void)
     while (1) {
         iter++;
 
-        /* One heartbeat per outer loop, including accumulated
-         * overrun and mid-frame-error counters. Do NOT add prints
-         * inside spi0_read_frame — the UART can't keep up at 20 MHz
-         * SPI, and the resulting saturation is what caused the
-         * initial overrun storm. */
-        dbg("[DEBUG] iter=%lu ok=%lu bad=%lu ovr=%lu mid=%lu\r\n",
+        /* One heartbeat per outer loop. `wcnt` is a hardware counter
+         * of bytes the master has clocked to us, masked to the 10-bit
+         * field in SLVDATACNT (wraps every 1024 bytes). If wcnt is
+         * advancing between heartbeats, bytes ARE reaching the slave
+         * even if we can't drain them fast enough. If wcnt stays
+         * constant, nothing is on the wire. */
+        uint32_t wcnt = 0;
+        {
+            ATCSPI200_RegDef *atc =
+                (ATCSPI200_RegDef *)SPI_0->base_address;
+            wcnt = (atc->SLVDATACNT & ATCSPI200_SLVDATACNT_WCNT_MASK)
+                   >> ATCSPI200_SLVDATACNT_WCNT_OFFSET;
+        }
+        dbg("[DEBUG] iter=%lu ok=%lu bad=%lu mid=%lu wcnt=%lu\r\n",
             (unsigned long)iter,
             (unsigned long)frames_ok,
             (unsigned long)frames_bad,
-            (unsigned long)g_overruns,
-            (unsigned long)g_midframe_err);
+            (unsigned long)g_midframe_err,
+            (unsigned long)wcnt);
 
         if (rc) {
             /* SPI init failed — keep heartbeat, don't touch driver. */
