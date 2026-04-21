@@ -188,20 +188,37 @@ static int spi0_init(void)
     return 0;
 }
 
-/* Poll the RX FIFO for one byte. Three outcomes:
+/* Poll the RX FIFO for one byte.
+ *
+ * `strict_overrun`:
+ *    true  - treat RXFIFOORINT as fatal and return -2 immediately.
+ *            Used inside a frame, where dropped bytes desync us.
+ *    false - treat RXFIFOORINT as informational: bump the overrun
+ *            counter, clear the flag, and keep polling. Used during
+ *            magic search, where losing bytes is harmless because
+ *            we're just scanning a stream for a 4-byte pattern.
+ *
+ * Returns:
  *    0  - got a byte, written to *b
  *   -1  - timeout: no byte arrived within `budget` polls
- *   -2  - RX FIFO overrun: master outran us, data was dropped, bus is
- *         desynced. Caller MUST flush the FIFO and resync on magic. */
-static int spi0_poll_byte(uint8_t *b, uint32_t budget)
+ *   -2  - RX FIFO overrun (only when strict_overrun=true) */
+static int spi0_poll_byte(uint8_t *b, uint32_t budget, int strict_overrun)
 {
     ATCSPI200_RegDef *atc = (ATCSPI200_RegDef *)SPI_0->base_address;
 
     for (uint32_t i = 0; i < budget; i++) {
-        /* Catch overrun early. RXFIFOORINT is W1C. */
+        /* Overrun detection. RXFIFOORINT is W1C. */
         if (atc->INTRST & ATCSPI200_INTRST_RXFIFOORINT_MASK) {
             atc->INTRST = ATCSPI200_INTRST_RXFIFOORINT_MASK;
-            return -2;
+            g_overruns++;
+            if (strict_overrun) {
+                return -2;
+            }
+            /* Non-strict: data was dropped but we're still scanning
+             * for magic. Clearing the flag is enough; don't flush
+             * the FIFO here because bytes may already be queued and
+             * flushing would drop them too. Fall through to the
+             * empty check. */
         }
         if (!(atc->STATUS & ATCSPI200_STATUS_RXEMPTY_MASK)) {
             /* DATAMERGE=0, so low byte of DATA is the next received
@@ -245,15 +262,15 @@ static int spi0_read_frame(iq_spi_frame_t *frame)
 
     while (remaining > 0) {
         uint8_t b;
-        int rc = spi0_poll_byte(&b, remaining);
+        /* Non-strict: overruns while scanning for magic are OK. */
+        int rc = spi0_poll_byte(&b, remaining, 0);
         if (rc == -1) {
             /* No magic in this window. Let outer loop heartbeat. */
             return 0;
         }
-        if (rc == -2) {
-            g_overruns++;
-            atc->CTRL |= ATCSPI200_CTRL_RXFIFORST_MASK;
-            return -1;
+        /* rc == -2 can't happen in non-strict mode; kept for safety. */
+        if (rc < 0) {
+            return 0;
         }
         if (remaining > 1) remaining--;
 
@@ -268,7 +285,9 @@ static int spi0_read_frame(iq_spi_frame_t *frame)
             dst[3] = MAGIC_B3;
 
             for (size_t n = 4; n < sizeof(*frame); n++) {
-                rc = spi0_poll_byte(&dst[n], INBAND_BUDGET);
+                /* Strict: mid-frame overrun is fatal, we've lost
+                 * position and the remaining bytes are garbage. */
+                rc = spi0_poll_byte(&dst[n], INBAND_BUDGET, 1);
                 if (rc) {
                     g_midframe_err++;
                     atc->CTRL |= ATCSPI200_CTRL_RXFIFORST_MASK;
@@ -303,7 +322,7 @@ int main(void)
     static iq_spi_frame_t frame;
     int rc;
 
-    dbg("[DEBUG] spi0 smoke start (direct-register slave RX)\r\n");
+    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v3 non-strict-ovr]\r\n");
 
     rc = spi0_init();
     if (rc) {
