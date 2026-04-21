@@ -213,12 +213,24 @@ static int spi0_poll_byte(uint8_t *b, uint32_t budget)
     return -1;
 }
 
+/* Counters exposed to the outer loop for periodic summary prints.
+ * We deliberately DO NOT print anything from inside the hot poll loop —
+ * every dbg() is a synchronous UART transmit and at 20 MHz SPI we
+ * don't have the time. UART saturation was also garbling the existing
+ * heartbeat lines (characters dropped mid-string). */
+static volatile uint32_t g_overruns = 0;
+static volatile uint32_t g_midframe_err = 0;
+
 /* Read one IQ frame from the SPI bus. Returns:
  *    1  - full frame received and copied into *frame
  *    0  - no frame yet (poll budget exhausted before finding magic).
  *         Caller should loop and heartbeat.
  *   -1  - bus error (overrun or stall mid-frame). Caller should
- *         resync on the next call. */
+ *         resync on the next call.
+ *
+ * Note: this function is SILENT. No dbg() calls, no prints. Every
+ * UART TX in here used to push us over the byte-time budget at 20 MHz
+ * SPI and caused the exact overruns we were trying to diagnose. */
 static int spi0_read_frame(iq_spi_frame_t *frame)
 {
     const uint32_t SEARCH_BUDGET = 10000000u; /* ~one heartbeat */
@@ -239,13 +251,10 @@ static int spi0_read_frame(iq_spi_frame_t *frame)
             return 0;
         }
         if (rc == -2) {
-            dbg("[DEBUG] spi rx overrun in magic-search, flushing\r\n");
+            g_overruns++;
             atc->CTRL |= ATCSPI200_CTRL_RXFIFORST_MASK;
             return -1;
         }
-        /* We don't know exactly how many budget slots the poll used;
-         * approximate by decrementing one. Only affects heartbeat
-         * cadence, not correctness. */
         if (remaining > 1) remaining--;
 
         w0 = w1; w1 = w2; w2 = w3; w3 = b;
@@ -261,9 +270,7 @@ static int spi0_read_frame(iq_spi_frame_t *frame)
             for (size_t n = 4; n < sizeof(*frame); n++) {
                 rc = spi0_poll_byte(&dst[n], INBAND_BUDGET);
                 if (rc) {
-                    dbg("[DEBUG] mid-frame rc=%d at n=%u "
-                        "(overrun or stall)\r\n",
-                        rc, (unsigned)n);
+                    g_midframe_err++;
                     atc->CTRL |= ATCSPI200_CTRL_RXFIFORST_MASK;
                     return -1;
                 }
@@ -313,15 +320,17 @@ int main(void)
     while (1) {
         iter++;
 
-        /* One heartbeat per outer loop. Each iteration either receives
-         * a frame quickly or burns SEARCH_BUDGET polls waiting for
-         * magic (~seconds). Once frames are flowing, iter/ok will
-         * advance in lockstep; while idle, iter will advance every
-         * heartbeat and ok will stay at 0. */
-        dbg("[DEBUG] spi0 loop iter=%lu ok=%lu bad=%lu\r\n",
+        /* One heartbeat per outer loop, including accumulated
+         * overrun and mid-frame-error counters. Do NOT add prints
+         * inside spi0_read_frame — the UART can't keep up at 20 MHz
+         * SPI, and the resulting saturation is what caused the
+         * initial overrun storm. */
+        dbg("[DEBUG] iter=%lu ok=%lu bad=%lu ovr=%lu mid=%lu\r\n",
             (unsigned long)iter,
             (unsigned long)frames_ok,
-            (unsigned long)frames_bad);
+            (unsigned long)frames_bad,
+            (unsigned long)g_overruns,
+            (unsigned long)g_midframe_err);
 
         if (rc) {
             /* SPI init failed — keep heartbeat, don't touch driver. */
@@ -330,11 +339,11 @@ int main(void)
 
         int r = spi0_read_frame(&frame);
         if (r == 0) {
-            dbg("[DEBUG] no magic in search window (bus idle?)\r\n");
+            /* Outer heartbeat already prints counters; don't spam
+             * additional lines here. */
             continue;
         }
         if (r < 0) {
-            dbg("[DEBUG] spi0 read error, resyncing\r\n");
             frames_bad++;
             continue;
         }
