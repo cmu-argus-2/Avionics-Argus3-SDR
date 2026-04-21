@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <string.h>
 
 #include <eff.h>
@@ -8,11 +9,25 @@
 #include <eff/drivers/uart.h>
 
 /* Direct register access to the ATCSPI200 controller behind SPI_0.
- * The SDK's eff_spi_cfg_t does not expose a master/slave field, but
- * the underlying IP has TRANSFMT.SLVMODE (bit 2) which flips the
- * controller into slave mode. We poke that bit manually after
- * eff_spi_init() has set up everything else. See
- * /home/argus/effcc/sdk/include/eff/atc/atcspi200.h lines 126-128. */
+ *
+ * Two things we can't do through the SDK wrapper and therefore do
+ * ourselves against the raw register block:
+ *
+ *   1. Put the controller into SLAVE mode. eff_spi_cfg_t exposes no
+ *      master/slave field; eff_spi_init() leaves TRANSFMT.SLVMODE=0.
+ *      We OR in SLVMODE=1 manually so SCK/CS become inputs driven by
+ *      the Pi master.
+ *
+ *   2. Receive bytes. eff_spi_xfer() hangs forever in slave mode —
+ *      empirically confirmed: the debug print immediately before the
+ *      call fires, the one after never does. The implementation
+ *      almost certainly polls a master-side completion flag
+ *      (STATUS.SPIACTIVE or TX-done) that is never asserted when the
+ *      Pi is the one driving SCK. Slave RX doesn't need any of that:
+ *      the hardware autonomously pushes received bytes into the RX
+ *      FIFO as SCK edges arrive, and we just drain them by polling
+ *      STATUS.RXEMPTY + reading DATA. See spi0_poll_byte() and
+ *      spi0_read_frame() below. */
 #include <eff/atc/atcspi200.h>
 
 /* ---------------- UART (debug output) ----------------
@@ -23,42 +38,28 @@
  *   /dev/ttyACM2 -> monitoring (this is what minicom should attach to)
  *
  * /dev/ttyACM2 is physically wired to UART_3 on the Efficient chip.
- * This was confirmed empirically: with -DEFF_STDIO_PORT=3 the printf()
- * banner at the top of main() appears in minicom; with =4 it does not.
- * Earlier comments in this file (and in main.c) claimed UART_4 was the
- * monitoring UART — that was wrong, and is why nothing ever showed up
- * when we pushed output through eff_uart_puts(UART_4, ...).
+ * Confirmed empirically: with -DEFF_STDIO_PORT=3 the printf() banner
+ * at the top of main() appears in minicom; with =4 it does not.
  *
- * Per the UART + pinmux docs, any UART other than the boot UART must be
- * BOTH eff_uart_init()'d AND have its pin group switched to UART mode
- * via eff_pinmux_set(PINMUX_3, PINMUX_UART) before anything you write
- * can reach the pins. We do both below in uart_debug_init().
- *
- * run_simple.sh therefore builds with -DEFF_STDIO_PORT=3 so that
- * printf() and our explicit eff_uart_puts(UART_3, ...) both hit the
- * same physical wire, and we use both paths as a belt-and-suspenders
- * early sanity check.
+ * Per the UART + pinmux docs, any UART other than the boot UART must
+ * be BOTH eff_uart_init()'d AND have its pin group switched to UART
+ * mode via eff_pinmux_set(PINMUX_3, PINMUX_UART) before anything you
+ * write can reach the pins. We do both below in uart_debug_init().
  */
 #define UART_DEV        UART_3
 #define UART_PINMUX     PINMUX_3
 
 /* ---------------- SPI -----------------
  *
- * Pin group selection, per the pinmux PDF and board wiring (per user):
- *   - SPI_0's physical pads on this board sit in pin group PINMUX_4,
- *     which is the pin group normally shared with UART_4. Since our
- *     debug UART is UART_3 (pin group PINMUX_3), UART_4 is unused, so
- *     we can safely hand all four pins of pin group 4 to SPI.
+ * Pin group selection, per the pinmux PDF and board wiring:
+ *   - SPI_0's physical pads on this board sit in pin group PINMUX_4.
+ *     (Same group that would otherwise be UART_4, but we use UART_3
+ *      for debug, so pin group 4 is free.)
  *   - PINMUX_SPI = "SPI only" mode for that pin group.
  *
- * Link direction: the Raspberry Pi is the SPI master and clocks IQ
+ * Link direction: the Raspberry Pi is the SPI MASTER and clocks IQ
  * frames *into* the Efficient board; the Efficient board is the
- * receiver. Since the SDK's eff_spi_cfg_t cannot express master-vs-
- * slave, we let eff_spi_init() configure the controller as master
- * (the default), then manually set TRANSFMT.SLVMODE=1 on the raw
- * ATCSPI200 register block to switch to slave mode. In slave mode SCK
- * and CS are inputs driven by the Pi, and our MOSI becomes the data-in
- * line. No bus contention — only one device drives the clock.
+ * SLAVE receiver. No bus contention — only the Pi drives SCK/CS.
  */
 #define SPI_DEV         SPI_0
 #define SPI_PINMUX      PINMUX_4
@@ -67,6 +68,14 @@
 #define FRAME_MAGIC       0x49515130u
 #define FRAME_VERSION     1u
 #define FRAME_DATA_BYTES  2048u
+
+/* Little-endian byte order of FRAME_MAGIC as it appears on the wire.
+ * The Pi writes the struct byte-for-byte; on a little-endian ARM host
+ * that means MAGIC is sent as 0x30, 0x51, 0x51, 0x49. */
+#define MAGIC_B0 0x30u
+#define MAGIC_B1 0x51u
+#define MAGIC_B2 0x51u
+#define MAGIC_B3 0x49u
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -105,18 +114,47 @@ static void dbg(const char *fmt, ...)
     eff_uart_puts(UART_DEV, buf);
 }
 
-/* ---------------- SPI ---------------- */
+/* ---------------- SPI: slave-mode direct-register driver ----------------
+ *
+ * What spi0_init() does beyond eff_spi_init():
+ *
+ *   1. Set TRANSFMT.SLVMODE=1 so SCK/CS become inputs.
+ *   2. Clear TRANSFMT.DATAMERGE (default is 1, which packs 4 received
+ *      bytes into each 32-bit DATA word). With DATAMERGE=0 each read
+ *      of DATA returns exactly one received byte in the low 8 bits —
+ *      no packing, no alignment bookkeeping, no tricky resync.
+ *   3. Pulse CTRL.RXFIFORST to flush any junk left over from init.
+ *   4. Clear INTRST (W1C) so a later RXFIFOORINT unambiguously means
+ *      "new overrun, not stale state from init."
+ *
+ * spi0_poll_byte() implements the "wait for one byte" primitive by
+ * polling STATUS.RXEMPTY, with RX-FIFO-overrun detection via
+ * INTRST.RXFIFOORINT.
+ *
+ * spi0_read_frame() does:
+ *   (a) Slide a 4-byte window over arriving bytes until it matches
+ *       the wire byte pattern of FRAME_MAGIC (0x30 51 51 49).
+ *   (b) Copy those four bytes into *frame and then pull the remaining
+ *       sizeof(*frame)-4 bytes with a tight per-byte deadline.
+ *
+ * Budgets:
+ *   SEARCH_BUDGET is loose — while we're waiting for the Pi to begin
+ *   sending, we want one heartbeat every ~second or two. The exact
+ *   timing doesn't matter, just that it doesn't go silent.
+ *
+ *   INBAND_BUDGET is tight — once we're locked onto magic, each
+ *   subsequent byte should arrive within one master clock period
+ *   (microseconds at 20 MHz). A stall means the Pi stopped or CS
+ *   went idle mid-frame, and the rest of the frame is junk.
+ */
 
 static int spi0_init(void)
 {
     eff_spi_cfg_t spi_cfg = EFF_SPI_DEFAULTS;
     spi_cfg.xfer_mode = SPI_XFER_READ_ONLY;
     spi_cfg.bus_size  = SPI_BUS_SINGLE;
-    /* clk_div is irrelevant in slave mode — the Pi master drives SCK.
-     * We leave it at the default from EFF_SPI_DEFAULTS. */
+    /* clk_div is irrelevant in slave mode — the Pi drives SCK. */
 
-    /* Init order matches the canonical SPI example in the Efficient
-     * docs (controller first, then pinmux). */
     if (eff_spi_init(SPI_DEV, &spi_cfg)) {
         return -1;
     }
@@ -124,118 +162,184 @@ static int spi0_init(void)
         return -2;
     }
 
-    /* Flip the controller into SLAVE mode by setting TRANSFMT.SLVMODE.
-     *
-     * The SDK wrapper has already written TRANSFMT with everything
-     * else (data length, CPOL/CPHA, etc.) at defaults and left SLVMODE
-     * at 0 (master). We OR in the SLVMODE bit as the very last step of
-     * bring-up, before any data transfer is requested, so the hardware
-     * sees a coherent slave-mode config when the Pi first asserts CS.
-     *
-     * SPI_0 is a handle to eff_spi_t, whose base_address points at the
-     * ATCSPI200 register block (see sdk/drivers/spi/spi.c). */
-    {
-        ATCSPI200_RegDef *atc = (ATCSPI200_RegDef *)SPI_0->base_address;
-        atc->TRANSFMT |= ATCSPI200_TRANSFMT_SLVMODE_MASK;
+    ATCSPI200_RegDef *atc = (ATCSPI200_RegDef *)SPI_0->base_address;
+
+    /* (1) + (2): flip to slave mode AND disable DATAMERGE in a single
+     * RMW so the hardware never sees a transient "slave + merged"
+     * state (which the IP may or may not support). */
+    uint32_t fmt = atc->TRANSFMT;
+    fmt |=  ATCSPI200_TRANSFMT_SLVMODE_MASK;
+    fmt &= ~ATCSPI200_TRANSFMT_DATAMERGE_MASK;
+    atc->TRANSFMT = fmt;
+
+    /* (3) flush anything stale from the RX FIFO. RXFIFORST self-clears
+     * after the hardware completes the reset; bounded wait so a stuck
+     * bit can't hang us here. */
+    atc->CTRL |= ATCSPI200_CTRL_RXFIFORST_MASK;
+    for (int i = 0; i < 10000 &&
+         (atc->CTRL & ATCSPI200_CTRL_RXFIFORST_MASK); i++) {
+        /* spin */
     }
+
+    /* (4) clear all W1C interrupt-status bits. Writing the current
+     * value back clears exactly whichever bits were set. */
+    atc->INTRST = atc->INTRST;
 
     return 0;
 }
 
+/* Poll the RX FIFO for one byte. Three outcomes:
+ *    0  - got a byte, written to *b
+ *   -1  - timeout: no byte arrived within `budget` polls
+ *   -2  - RX FIFO overrun: master outran us, data was dropped, bus is
+ *         desynced. Caller MUST flush the FIFO and resync on magic. */
+static int spi0_poll_byte(uint8_t *b, uint32_t budget)
+{
+    ATCSPI200_RegDef *atc = (ATCSPI200_RegDef *)SPI_0->base_address;
+
+    for (uint32_t i = 0; i < budget; i++) {
+        /* Catch overrun early. RXFIFOORINT is W1C. */
+        if (atc->INTRST & ATCSPI200_INTRST_RXFIFOORINT_MASK) {
+            atc->INTRST = ATCSPI200_INTRST_RXFIFOORINT_MASK;
+            return -2;
+        }
+        if (!(atc->STATUS & ATCSPI200_STATUS_RXEMPTY_MASK)) {
+            /* DATAMERGE=0, so low byte of DATA is the next received
+             * byte on MOSI. Upper bytes are undefined; ignore them. */
+            *b = (uint8_t)(atc->DATA & 0xFFu);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Read one IQ frame from the SPI bus. Returns:
+ *    1  - full frame received and copied into *frame
+ *    0  - no frame yet (poll budget exhausted before finding magic).
+ *         Caller should loop and heartbeat.
+ *   -1  - bus error (overrun or stall mid-frame). Caller should
+ *         resync on the next call. */
 static int spi0_read_frame(iq_spi_frame_t *frame)
 {
+    const uint32_t SEARCH_BUDGET = 10000000u; /* ~one heartbeat */
+    const uint32_t INBAND_BUDGET =   200000u; /* tight mid-frame deadline */
+
+    ATCSPI200_RegDef *atc = (ATCSPI200_RegDef *)SPI_0->base_address;
+
+    uint8_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+    uint32_t remaining = SEARCH_BUDGET;
+
     memset(frame, 0, sizeof(*frame));
 
-    /* Bracket the xfer with debug prints so we can tell from minicom
-     * whether eff_spi_xfer is blocking forever vs. returning an error.
-     * Without these prints we can't distinguish "the driver hung on the
-     * first call" from "everything is fine, just no frames yet". */
-    dbg("[DEBUG] spi_xfer: enter (rx %u bytes)\r\n",
-        (unsigned)sizeof(*frame));
+    while (remaining > 0) {
+        uint8_t b;
+        int rc = spi0_poll_byte(&b, remaining);
+        if (rc == -1) {
+            /* No magic in this window. Let outer loop heartbeat. */
+            return 0;
+        }
+        if (rc == -2) {
+            dbg("[DEBUG] spi rx overrun in magic-search, flushing\r\n");
+            atc->CTRL |= ATCSPI200_CTRL_RXFIFORST_MASK;
+            return -1;
+        }
+        /* We don't know exactly how many budget slots the poll used;
+         * approximate by decrementing one. Only affects heartbeat
+         * cadence, not correctness. */
+        if (remaining > 1) remaining--;
 
-    /* eff_spi_xfer returns 0 on success, nonzero on error. */
-    int8_t rc = eff_spi_xfer(SPI_DEV, 0, 0, NULL, 0,
-                             (uint8_t *)frame, (uint32_t)sizeof(*frame));
+        w0 = w1; w1 = w2; w2 = w3; w3 = b;
 
-    dbg("[DEBUG] spi_xfer: exit rc=%d\r\n", (int)rc);
+        if (w0 == MAGIC_B0 && w1 == MAGIC_B1 &&
+            w2 == MAGIC_B2 && w3 == MAGIC_B3) {
+            uint8_t *dst = (uint8_t *)frame;
+            dst[0] = MAGIC_B0;
+            dst[1] = MAGIC_B1;
+            dst[2] = MAGIC_B2;
+            dst[3] = MAGIC_B3;
 
-    if (rc) {
-        return 0;
+            for (size_t n = 4; n < sizeof(*frame); n++) {
+                rc = spi0_poll_byte(&dst[n], INBAND_BUDGET);
+                if (rc) {
+                    dbg("[DEBUG] mid-frame rc=%d at n=%u "
+                        "(overrun or stall)\r\n",
+                        rc, (unsigned)n);
+                    atc->CTRL |= ATCSPI200_CTRL_RXFIFORST_MASK;
+                    return -1;
+                }
+            }
+            return 1;
+        }
     }
-    return 1;
+    return 0;
 }
 
 /* ---------------- main ---------------- */
 
 int main(void)
 {
-    /* printf() before any explicit init. With -DEFF_STDIO_PORT=3 (see
-     * run_simple.sh) the stdio runtime routes this to UART_3, which is
-     * physically wired to /dev/ttyACM2 (monitoring). This line is the
-     * first thing the user will actually see in minicom and confirms
-     * the board booted and reached main(). */
+    /* printf() before any explicit init. With -DEFF_STDIO_PORT=3 the
+     * stdio runtime routes this to UART_3, which is physically wired
+     * to /dev/ttyACM2 (monitoring). First thing the user sees in
+     * minicom — confirms the board booted and reached main(). */
     printf("\r\n[DEBUG] spi0 smoke: entering main (stdio path)\r\n");
 
-    /* Bring up UART_3 FIRST, before anything else could try to talk. */
+    /* Bring up UART_3 before anything else could try to talk. */
     if (uart_debug_init()) {
-        /* Nothing we can do if this fails — there's no other output
-         * path. Fall through silently so the CPU doesn't hang here. */
+        /* Nothing we can do — no other output path. Fall through. */
     }
 
-    /* Immediate sanity print so we can see the board is alive before
-     * any peripheral configuration touches pins. This uses the explicit
-     * eff_uart_puts() path on UART_3 (the monitoring UART). */
     eff_uart_puts(UART_DEV, "\r\n=== spi0 smoke: UART_3 alive ===\r\n");
 
-    /* IMPORTANT: the IQ frame is 2068 bytes. Allocating it on main()'s
-     * stack is risky on this core — a stack overflow during SPI xfer
-     * would look exactly like a hang (which is one of the candidate
-     * causes for why we only see "iter=1" today). Move it to static
-     * storage so we can rule that out as a confound. */
+    /* Static storage: 2068-byte struct on main's stack is borderline
+     * risky on this core and has masked earlier diagnostics. */
     static iq_spi_frame_t frame;
     int rc;
 
-    dbg("[DEBUG] spi0 smoke start\r\n");
+    dbg("[DEBUG] spi0 smoke start (direct-register slave RX)\r\n");
 
     rc = spi0_init();
     if (rc) {
         dbg("[DEBUG] spi0 init failed rc=%d\r\n", rc);
-        /* Don't return — keep the heartbeat going so you can confirm
-         * the board hasn't silently crashed. */
     } else {
-        dbg("[DEBUG] spi0 init ok, waiting for frames\r\n");
+        dbg("[DEBUG] spi0 init ok: SLVMODE=1, DATAMERGE=0, RX FIFO reset\r\n");
+        dbg("[DEBUG] waiting for Pi master to clock frames onto MOSI\r\n");
     }
 
-    dbg("[DEBUG] SPI_0 running in SLAVE mode (TRANSFMT.SLVMODE=1).\r\n"
-        "        Waiting for Pi master to clock in frames on MOSI.\r\n");
-
     uint32_t iter = 0;
+    uint32_t frames_ok = 0;
+    uint32_t frames_bad = 0;
+
     while (1) {
         iter++;
 
-        /* Heartbeat on EVERY iteration during diagnosis. Previously
-         * this only fired every 64 iterations, which made it
-         * impossible to tell whether the loop had advanced at all past
-         * a blocking eff_spi_xfer. Once we know the SPI path is
-         * behaving, we can throttle this back. */
-        dbg("[DEBUG] spi0 loop iter=%lu\r\n", (unsigned long)iter);
+        /* One heartbeat per outer loop. Each iteration either receives
+         * a frame quickly or burns SEARCH_BUDGET polls waiting for
+         * magic (~seconds). Once frames are flowing, iter/ok will
+         * advance in lockstep; while idle, iter will advance every
+         * heartbeat and ok will stay at 0. */
+        dbg("[DEBUG] spi0 loop iter=%lu ok=%lu bad=%lu\r\n",
+            (unsigned long)iter,
+            (unsigned long)frames_ok,
+            (unsigned long)frames_bad);
 
         if (rc) {
-            /* SPI init failed — don't hammer the broken driver, just
-             * keep the heartbeat going so we know the CPU is alive. */
+            /* SPI init failed — keep heartbeat, don't touch driver. */
             continue;
         }
 
-        /* Paranoia: if the xfer call is blocking, the line above
-         * ("iter=N") will be the last thing minicom ever sees. That's
-         * the diagnostic signal we're looking for. */
-        dbg("[DEBUG] about to call spi0_read_frame\r\n");
-
-        if (!spi0_read_frame(&frame)) {
-            dbg("[DEBUG] spi0 read failed\r\n");
+        int r = spi0_read_frame(&frame);
+        if (r == 0) {
+            dbg("[DEBUG] no magic in search window (bus idle?)\r\n");
+            continue;
+        }
+        if (r < 0) {
+            dbg("[DEBUG] spi0 read error, resyncing\r\n");
+            frames_bad++;
             continue;
         }
 
+        frames_ok++;
         dbg("[DEBUG] hdr magic=0x%08lx ver=%u bytes=%u seq=%lu fs=%lu cf=%lu i0=%u q0=%u\r\n",
             (unsigned long)frame.magic,
             (unsigned)frame.version,
