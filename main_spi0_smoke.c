@@ -195,6 +195,17 @@ static int spi0_init(void)
 static volatile uint32_t g_midframe_err = 0;
 static volatile uint32_t g_bytes_seen   = 0;  /* total bytes drained from RX FIFO */
 
+/* First-bytes buffer: capture the first 32 bytes the FIFO ever gives
+ * us, so on the first heartbeat after any RX activity we can print
+ * them and see what the hardware is actually delivering. This cuts
+ * through the guesswork: if we see 32 consecutive 0x00s, the stream
+ * is all zeros (or RXEMPTY is stuck and DATA returns 0); if we see
+ * meaningful bytes (including 0x30 0x51 0x51 0x49 somewhere), the
+ * Pi is actually sending frames. */
+#define FIRST_BYTES_CAP 32u
+static volatile uint32_t g_first_bytes_count = 0;
+static uint8_t           g_first_bytes[FIRST_BYTES_CAP];
+
 /* Poll the RX FIFO for one byte.
  *
  * IMPORTANT: we do NOT read INTRST here. INTRST is declared `__O`
@@ -292,27 +303,43 @@ static int spi0_poll_byte(uint8_t *b, uint32_t budget)
  * SPI and caused the exact overruns we were trying to diagnose. */
 static int spi0_read_frame(iq_spi_frame_t *frame)
 {
-    /* Much smaller than before so heartbeats fire frequently even
-     * when the Pi is silent — we'd rather get 10 heartbeats/sec that
-     * say "wcnt=X, bytes=Y" than wait seconds between them. */
-    const uint32_t SEARCH_BUDGET =   500000u;
-    const uint32_t INBAND_BUDGET =   200000u; /* tight mid-frame deadline */
+    /* Separate the three budgets so each has clear meaning:
+     *   SEARCH_MAX_BYTES — how many bytes we'll consume while
+     *                      searching for magic before giving up and
+     *                      letting the outer loop heartbeat. Bounded
+     *                      so a stuck-RXEMPTY FIFO (delivers bytes
+     *                      infinitely fast) can't lock us in here.
+     *   SEARCH_POLL_BUDGET — per-call timeout on spi0_poll_byte while
+     *                        searching. If no byte arrives in this
+     *                        many polls, we bail out and heartbeat.
+     *   INBAND_BUDGET — tight per-byte deadline once we're locked on
+     *                   magic and reading the rest of the frame. */
+    const uint32_t SEARCH_MAX_BYTES   =   10000u;
+    const uint32_t SEARCH_POLL_BUDGET =  500000u;
+    const uint32_t INBAND_BUDGET      =  200000u;
 
     ATCSPI200_RegDef *atc = (ATCSPI200_RegDef *)SPI_0->base_address;
 
     uint8_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
-    uint32_t remaining = SEARCH_BUDGET;
+    uint32_t bytes_consumed = 0;
 
     memset(frame, 0, sizeof(*frame));
 
-    while (remaining > 0) {
+    while (bytes_consumed < SEARCH_MAX_BYTES) {
         uint8_t b;
-        int rc = spi0_poll_byte(&b, remaining);
+        int rc = spi0_poll_byte(&b, SEARCH_POLL_BUDGET);
         if (rc == -1) {
             /* No byte in this window. Let outer loop heartbeat. */
             return 0;
         }
-        if (remaining > 1) remaining--;
+        bytes_consumed++;
+
+        /* Capture the first few bytes ever drained so main()'s next
+         * heartbeat can print them. Tells us what the FIFO is
+         * actually giving us vs. what we think it should give us. */
+        if (g_first_bytes_count < FIRST_BYTES_CAP) {
+            g_first_bytes[g_first_bytes_count++] = b;
+        }
 
         w0 = w1; w1 = w2; w2 = w3; w3 = b;
 
@@ -339,6 +366,9 @@ static int spi0_read_frame(iq_spi_frame_t *frame)
             return 1;
         }
     }
+    /* Burned SEARCH_MAX_BYTES without finding magic. Return and let
+     * outer loop heartbeat (and print g_first_bytes so we can see
+     * what we actually got). */
     return 0;
 }
 
@@ -364,7 +394,7 @@ int main(void)
     static iq_spi_frame_t frame;
     int rc;
 
-    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v8 probe-data-read]\r\n");
+    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v9 bound-search-bytes]\r\n");
 
     rc = spi0_init();
     if (rc) {
@@ -401,6 +431,28 @@ int main(void)
             (unsigned long)g_midframe_err,
             (unsigned long)wcnt,
             (unsigned long)g_bytes_seen);
+
+        /* Dump the first bytes we ever saw on the wire, once, as soon
+         * as we have at least 8. Gives us a "what did the FIFO
+         * actually give us" snapshot that's independent of magic
+         * matching. */
+        static volatile int first_bytes_dumped = 0;
+        if (!first_bytes_dumped && g_first_bytes_count >= 8u) {
+            first_bytes_dumped = 1;
+            /* Build a single line with all captured bytes in hex. */
+            char line[192];
+            int pos = 0;
+            pos += snprintf(line + pos, sizeof(line) - pos,
+                            "[DEBUG] first %lu bytes:",
+                            (unsigned long)g_first_bytes_count);
+            for (uint32_t k = 0; k < g_first_bytes_count &&
+                 pos < (int)sizeof(line) - 8; k++) {
+                pos += snprintf(line + pos, sizeof(line) - pos,
+                                " %02x", (unsigned)g_first_bytes[k]);
+            }
+            snprintf(line + pos, sizeof(line) - pos, "\r\n");
+            eff_uart_puts(UART_DEV, line);
+        }
 
         if (rc) {
             /* SPI init failed — keep heartbeat, don't touch driver. */
