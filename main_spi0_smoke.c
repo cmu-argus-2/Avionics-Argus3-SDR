@@ -206,6 +206,12 @@ static volatile uint32_t g_bytes_seen   = 0;  /* total bytes drained from RX FIF
 static volatile uint32_t g_first_bytes_count = 0;
 static uint8_t           g_first_bytes[FIRST_BYTES_CAP];
 
+/* Rolling last-16 bytes. Overwritten as we drain — shows whether the
+ * FIFO is giving us one repeated ghost value or actually new data. */
+#define LAST_BYTES_CAP 16u
+static volatile uint32_t g_last_bytes_idx = 0;
+static uint8_t           g_last_bytes[LAST_BYTES_CAP];
+
 /* Poll the RX FIFO for one byte.
  *
  * IMPORTANT: we do NOT read INTRST here. INTRST is declared `__O`
@@ -340,6 +346,10 @@ static int spi0_read_frame(iq_spi_frame_t *frame)
         if (g_first_bytes_count < FIRST_BYTES_CAP) {
             g_first_bytes[g_first_bytes_count++] = b;
         }
+        /* Also keep a rolling window of the last LAST_BYTES_CAP bytes,
+         * so we can tell stuck-ghost-value from actual data. */
+        g_last_bytes[g_last_bytes_idx % LAST_BYTES_CAP] = b;
+        g_last_bytes_idx++;
 
         w0 = w1; w1 = w2; w2 = w3; w3 = b;
 
@@ -394,7 +404,7 @@ int main(void)
     static iq_spi_frame_t frame;
     int rc;
 
-    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v9 bound-search-bytes]\r\n");
+    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v10 dump-regs-rolling]\r\n");
 
     rc = spi0_init();
     if (rc) {
@@ -418,11 +428,15 @@ int main(void)
          * even if we can't drain them fast enough. If wcnt stays
          * constant, nothing is on the wire. */
         uint32_t wcnt = 0;
+        uint32_t st_snap = 0;
+        uint32_t fmt_snap = 0;
         {
             ATCSPI200_RegDef *atc =
                 (ATCSPI200_RegDef *)SPI_0->base_address;
             wcnt = (atc->SLVDATACNT & ATCSPI200_SLVDATACNT_WCNT_MASK)
                    >> ATCSPI200_SLVDATACNT_WCNT_OFFSET;
+            st_snap  = atc->STATUS;
+            fmt_snap = atc->TRANSFMT;
         }
         dbg("[DEBUG] iter=%lu ok=%lu bad=%lu mid=%lu wcnt=%lu bytes=%lu\r\n",
             (unsigned long)iter,
@@ -431,6 +445,29 @@ int main(void)
             (unsigned long)g_midframe_err,
             (unsigned long)wcnt,
             (unsigned long)g_bytes_seen);
+        dbg("[DEBUG]   STATUS=0x%08lx TRANSFMT=0x%08lx\r\n",
+            (unsigned long)st_snap, (unsigned long)fmt_snap);
+
+        /* Dump the rolling last-bytes window so we can tell whether
+         * the FIFO is giving us one ghost value or actual new data. */
+        {
+            char line[128];
+            int pos = 0;
+            uint32_t n = g_last_bytes_idx < LAST_BYTES_CAP
+                         ? g_last_bytes_idx : LAST_BYTES_CAP;
+            pos += snprintf(line + pos, sizeof(line) - pos,
+                            "[DEBUG]   last %lu:",
+                            (unsigned long)n);
+            /* Print in stored order (not oldest-first); for ghost-value
+             * detection we only care whether they're all equal. */
+            for (uint32_t k = 0; k < n &&
+                 pos < (int)sizeof(line) - 8; k++) {
+                pos += snprintf(line + pos, sizeof(line) - pos,
+                                " %02x", (unsigned)g_last_bytes[k]);
+            }
+            snprintf(line + pos, sizeof(line) - pos, "\r\n");
+            eff_uart_puts(UART_DEV, line);
+        }
 
         /* Dump the first bytes we ever saw on the wire, once, as soon
          * as we have at least 8. Gives us a "what did the FIFO
