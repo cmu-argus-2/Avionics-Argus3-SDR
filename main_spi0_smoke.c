@@ -214,38 +214,66 @@ static int spi0_poll_byte(uint8_t *b, uint32_t budget)
 {
     ATCSPI200_RegDef *atc = (ATCSPI200_RegDef *)SPI_0->base_address;
 
-    /* ONE-SHOT probes. Prints the first time the function is called
-     * after boot, and the first time it completes its first STATUS
-     * read. Cheap (two bools) and tells us precisely whether the
-     * STATUS load instruction itself is taking a bus fault. */
-    static volatile int first_entry_printed = 0;
-    static volatile int first_status_printed = 0;
+    /* ONE-SHOT probes. A pack of static flags, each pinning down a
+     * specific place we might hang. Each fires at most once across
+     * all calls to this function, so they're cheap — and they give
+     * us a precise minicom trace of how far we got on the very first
+     * byte attempt. */
+    static volatile int p_entry      = 0;  /* function entered */
+    static volatile int p_status_1st = 0;  /* first STATUS read returned */
+    static volatile int p_notempty   = 0;  /* RXEMPTY cleared → about to read DATA */
+    static volatile int p_data_1st   = 0;  /* first DATA read returned */
+    static volatile int p_ret_byte   = 0;  /* returning a byte to caller */
+    static volatile int p_loop_i1    = 0;  /* entered loop body past i=0 */
+    static volatile int p_loop_i1k   = 0;  /* reached i=1000 with FIFO empty */
 
-    if (!first_entry_printed) {
-        first_entry_printed = 1;
-        dbg("[DEBUG] poll: first entry, about to read STATUS @ %p\r\n",
-            (void *)&atc->STATUS);
+    if (!p_entry) {
+        p_entry = 1;
+        dbg("[DEBUG] poll: entry, STATUS @ %p DATA @ %p\r\n",
+            (void *)&atc->STATUS, (void *)&atc->DATA);
     }
 
     for (uint32_t i = 0; i < budget; i++) {
+        if (i == 1u && !p_loop_i1) {
+            p_loop_i1 = 1;
+            dbg("[DEBUG] poll: reached i=1 (loop body executes)\r\n");
+        }
+        if (i == 1000u && !p_loop_i1k) {
+            p_loop_i1k = 1;
+            dbg("[DEBUG] poll: reached i=1000 (FIFO empty so far)\r\n");
+        }
         /* Diagnostic tap: every 100K polls, emit a progress mark so
          * we can tell from minicom whether this loop is actually
-         * running or whether the STATUS read hung us. Will be noisy
-         * but that's the point. */
+         * running or whether the STATUS read hung us. */
         if ((i % 100000u) == 0u && i > 0u) {
             dbg("[DEBUG] poll i=%lu\r\n", (unsigned long)i);
         }
         uint32_t st = atc->STATUS;
-        if (!first_status_printed) {
-            first_status_printed = 1;
-            dbg("[DEBUG] poll: first STATUS read returned 0x%08lx\r\n",
+        if (!p_status_1st) {
+            p_status_1st = 1;
+            dbg("[DEBUG] poll: first STATUS = 0x%08lx\r\n",
                 (unsigned long)st);
         }
         if (!(st & ATCSPI200_STATUS_RXEMPTY_MASK)) {
+            if (!p_notempty) {
+                p_notempty = 1;
+                dbg("[DEBUG] poll: RXEMPTY=0, about to read DATA\r\n");
+            }
             /* DATAMERGE=0, so low byte of DATA is the next received
              * byte on MOSI. Upper bytes are undefined; ignore them. */
-            *b = (uint8_t)(atc->DATA & 0xFFu);
+            uint32_t dv = atc->DATA;
+            if (!p_data_1st) {
+                p_data_1st = 1;
+                dbg("[DEBUG] poll: first DATA = 0x%08lx\r\n",
+                    (unsigned long)dv);
+            }
+            *b = (uint8_t)(dv & 0xFFu);
             g_bytes_seen++;
+            if (!p_ret_byte) {
+                p_ret_byte = 1;
+                dbg("[DEBUG] poll: returning first byte = 0x%02x\r\n",
+                    (unsigned)*b);
+            }
             return 0;
         }
     }
@@ -336,7 +364,7 @@ int main(void)
     static iq_spi_frame_t frame;
     int rc;
 
-    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v7 probe-status-read]\r\n");
+    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v8 probe-data-read]\r\n");
 
     rc = spi0_init();
     if (rc) {
