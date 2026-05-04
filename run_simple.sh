@@ -7,3 +7,4 @@ ninja Avionics-Argus3-SDR
 sudo /home/argus/effcc/bin/eff-flash apps/Avionics-Argus3-SDR/scalar/Avionics-Argus3-SDR.hex sram
 
 cd apps/Avionics-Argus3-SDR
+5
