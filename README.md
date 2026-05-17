@@ -13,13 +13,13 @@ Wiring (Pi -> Efficient):
 
 ```
 Pi SPI0_SCLK (GPIO 11, pin 23)  -> Efficient SPI0 SCK   (Pi drives)
-Pi SPI0_CE0  (GPIO 8,  pin 24)  -> Efficient SPI0 CS    (Pi drives)
+Pi SPI0_CE0  (GPIO 8,  pin 24)  -> Efficient SPI0 SS    (Pi drives)
 Pi SPI0_MOSI (GPIO 10, pin 19)  -> Efficient SPI0 MOSI  (Pi sends IQ)
 Pi SPI0_MISO (GPIO 9,  pin 21)  <- Efficient SPI0 MISO  (unused)
 Common ground.
 ```
 
-UART layout on the Argus3 dev board:
+UART layout on the Efficient dev board:
 
 ```
 /dev/ttyACM0 -> flashing (eff-flash)
@@ -27,7 +27,7 @@ UART layout on the Argus3 dev board:
 /dev/ttyACM2 -> debug / monitoring (UART_3 on the chip; this is what minicom should attach to)
 ```
 
-Pin groups: `PINMUX_3` is set to UART for debug; `PINMUX_4` is set to SPI for the IQ link (so SPI_0's pads are live and UART_4 is unused).
+Pin groups: `PINMUX_3` is set to UART for debug; `PINMUX_2` is set to SPI for the IQ link (so SPI_0's pads are live and UART_2 is unused).
 
 ## Current stage
 
@@ -54,8 +54,6 @@ What's still being chased:
 - End-to-end frame capture (a full `iq_spi_frame_t` arriving with correct magic/version/payload). The project is in the "stare at minicom output and chase the SPI slave RX path" phase.
 
 Other artifacts in the folder:
-- `Argus3_SDR_EndOfSemester.pptx` + `Argus3_SpeakerNotes.md` — end-of-semester deliverables.
-- `tone_down_pptx.py`, `trim_words_add_notes.py`, `inspect_deck.mjs` — one-off scripts used while preparing the deck.
 - `power.csv`, `power_SDR.csv`, `report.txt`, `report_sdr.txt`, `sample_SDR.log`, `parsed_iq.txt`, `raw.iq` — captures from earlier offline experiments.
 - `*.pdf` — Efficient Computer reference docs (GPIO, I2C, SPI, UART, Pinmux, Eval Kit getting started). Keep these handy when modifying low-level driver code.
 
