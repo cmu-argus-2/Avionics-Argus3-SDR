@@ -52,9 +52,9 @@
 /* ---------------- SPI -----------------
  *
  * Pin group selection, per the pinmux PDF and board wiring:
- *   - SPI_0's physical pads on this board sit in pin group PINMUX_4.
- *     (Same group that would otherwise be UART_4, but we use UART_3
- *      for debug, so pin group 4 is free.)
+ *   - SPI_0's physical pads on this board sit in pin group PINMUX_2.
+ *     (Corrected from earlier PINMUX_4 attempt — board routes SPI_0
+ *      through pin group 2 on this revision.)
  *   - PINMUX_SPI = "SPI only" mode for that pin group.
  *
  * Link direction: the Raspberry Pi is the SPI MASTER and clocks IQ
@@ -62,7 +62,7 @@
  * SLAVE receiver. No bus contention — only the Pi drives SCK/CS.
  */
 #define SPI_DEV         SPI_0
-#define SPI_PINMUX      PINMUX_4
+#define SPI_PINMUX      PINMUX_2
 #define SPI_PINMUX_CFG  PINMUX_SPI
 
 #define FRAME_MAGIC       0x49515130u
@@ -102,16 +102,19 @@ static int uart_debug_init(void)
     return 0;
 }
 
-/* snprintf into a local buffer and shove it out UART_3. Avoids any
- * dependency on the stdio port the CMake build picked. */
+/* vprintf-backed debug print. printf via stdio (routed to UART_3
+ * by -DEFF_STDIO_PORT=3) appears to be synchronous — it blocks
+ * until each byte has actually been transmitted, so consecutive
+ * dbg() calls don't race the UART TX FIFO and we don't see
+ * interleaved/garbled output. Empirically the first printf line
+ * at boot prints cleanly while same-content eff_uart_puts calls
+ * later do not. */
 static void dbg(const char *fmt, ...)
 {
-    char buf[256];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    vprintf(fmt, ap);
     va_end(ap);
-    eff_uart_puts(UART_DEV, buf);
 }
 
 /* ---------------- SPI: slave-mode direct-register driver ----------------
@@ -397,14 +400,16 @@ int main(void)
         /* Nothing we can do — no other output path. Fall through. */
     }
 
-    eff_uart_puts(UART_DEV, "\r\n=== spi0 smoke: UART_3 alive ===\r\n");
+    /* Use printf (synchronous) instead of eff_uart_puts so this
+     * line is guaranteed to flush before the next ones. */
+    printf("\r\n=== spi0 smoke: UART_3 alive ===\r\n");
 
     /* Static storage: 2068-byte struct on main's stack is borderline
      * risky on this core and has masked earlier diagnostics. */
     static iq_spi_frame_t frame;
     int rc;
 
-    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v10 dump-regs-rolling]\r\n");
+    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v14 all-printf]\r\n");
 
     rc = spi0_init();
     if (rc) {
@@ -438,36 +443,17 @@ int main(void)
             st_snap  = atc->STATUS;
             fmt_snap = atc->TRANSFMT;
         }
-        dbg("[DEBUG] iter=%lu ok=%lu bad=%lu mid=%lu wcnt=%lu bytes=%lu\r\n",
+        /* Single compact line per heartbeat. printf is synchronous
+         * so no garbling. Anything noteworthy (real frame, error)
+         * prints its own additional line elsewhere. */
+        dbg("[H] it=%lu ok=%lu bad=%lu w=%lu b=%lu st=%08lx fmt=%08lx\r\n",
             (unsigned long)iter,
             (unsigned long)frames_ok,
             (unsigned long)frames_bad,
-            (unsigned long)g_midframe_err,
             (unsigned long)wcnt,
-            (unsigned long)g_bytes_seen);
-        dbg("[DEBUG]   STATUS=0x%08lx TRANSFMT=0x%08lx\r\n",
-            (unsigned long)st_snap, (unsigned long)fmt_snap);
-
-        /* Dump the rolling last-bytes window so we can tell whether
-         * the FIFO is giving us one ghost value or actual new data. */
-        {
-            char line[128];
-            int pos = 0;
-            uint32_t n = g_last_bytes_idx < LAST_BYTES_CAP
-                         ? g_last_bytes_idx : LAST_BYTES_CAP;
-            pos += snprintf(line + pos, sizeof(line) - pos,
-                            "[DEBUG]   last %lu:",
-                            (unsigned long)n);
-            /* Print in stored order (not oldest-first); for ghost-value
-             * detection we only care whether they're all equal. */
-            for (uint32_t k = 0; k < n &&
-                 pos < (int)sizeof(line) - 8; k++) {
-                pos += snprintf(line + pos, sizeof(line) - pos,
-                                " %02x", (unsigned)g_last_bytes[k]);
-            }
-            snprintf(line + pos, sizeof(line) - pos, "\r\n");
-            eff_uart_puts(UART_DEV, line);
-        }
+            (unsigned long)g_bytes_seen,
+            (unsigned long)st_snap,
+            (unsigned long)fmt_snap);
 
         /* Dump the first bytes we ever saw on the wire, once, as soon
          * as we have at least 8. Gives us a "what did the FIFO
@@ -476,19 +462,13 @@ int main(void)
         static volatile int first_bytes_dumped = 0;
         if (!first_bytes_dumped && g_first_bytes_count >= 8u) {
             first_bytes_dumped = 1;
-            /* Build a single line with all captured bytes in hex. */
-            char line[192];
-            int pos = 0;
-            pos += snprintf(line + pos, sizeof(line) - pos,
-                            "[DEBUG] first %lu bytes:",
-                            (unsigned long)g_first_bytes_count);
-            for (uint32_t k = 0; k < g_first_bytes_count &&
-                 pos < (int)sizeof(line) - 8; k++) {
-                pos += snprintf(line + pos, sizeof(line) - pos,
-                                " %02x", (unsigned)g_first_bytes[k]);
+            /* Use printf one byte at a time — synchronous, no race. */
+            dbg("[DEBUG] first %lu bytes:",
+                (unsigned long)g_first_bytes_count);
+            for (uint32_t k = 0; k < g_first_bytes_count; k++) {
+                dbg(" %02x", (unsigned)g_first_bytes[k]);
             }
-            snprintf(line + pos, sizeof(line) - pos, "\r\n");
-            eff_uart_puts(UART_DEV, line);
+            dbg("\r\n");
         }
 
         if (rc) {
@@ -537,6 +517,14 @@ int main(void)
         }
         if (frame.payload_bytes != FRAME_DATA_BYTES) {
             dbg("[DEBUG] bad payload_bytes\r\n");
+        }
+
+        /* Rate-limit heartbeats so the UART TX FIFO doesn't overflow
+         * and garble output. ~1 heartbeat/sec is plenty for human
+         * monitoring; real frames will print their own header. The
+         * exact spin count is core-speed dependent — tune if needed. */
+        for (volatile uint32_t s = 0; s < 2000000u; s++) {
+            /* spin */
         }
     }
 
