@@ -40,18 +40,26 @@ CMakeLists.txt -> SOURCE main_spi0_smoke.c
 `main_spi0_smoke.c` is the bring-up program that:
 
 - Configures `SPI_0` as a slave by directly poking `ATCSPI200_TRANSFMT.SLVMODE = 1` (the SDK's `eff_spi_cfg_t` doesn't expose that bit).
-- Disables `DATAMERGE` so each `DATA` read returns one received byte.
-- Drains the RX FIFO by polling `STATUS.RXEMPTY` (the SDK's `eff_spi_xfer()` hangs forever in slave mode).
+- Disables `DATAMERGE` so each `DATA` read returns one received byte (in theory; see caveats below).
+- Drains the RX FIFO by polling the raw ATCSPI200 registers, not via `eff_spi_xfer()` (which hangs forever in slave mode — it appears to poll a master-side completion flag that's never asserted when the Pi drives SCK).
 - Slides a 4-byte window looking for the frame magic, then captures the rest of the frame with a tight per-byte deadline.
-- Emits per-iteration heartbeats over UART_3 with counters (`ok / bad / mid-frame errors / bytes drained / SLVDATACNT.WCNT / STATUS / TRANSFMT`) plus a rolling last-16-bytes window so we can tell stuck-ghost-value vs. real traffic.
+- Emits one compact heartbeat per outer iteration over UART_3: `[H] it=N ok=N bad=N w=N b=N st=XXXXXXXX fmt=XXXXXXXX` where `w` is `SLVDATACNT.WCNT` (10-bit master-write count, wraps every 1024 bytes), `b` is total bytes drained, `st` is `STATUS`, `fmt` is `TRANSFMT`.
 
 What works:
 - Boot + UART_3 debug path is reliable.
 - SPI_0 slave init no longer hangs; the heartbeat loop runs steadily.
-- `SLVDATACNT.WCNT` advances when the Pi clocks data, confirming bytes physically reach the slave.
+- `SLVDATACNT.WCNT` advances when the Pi clocks data, confirming bytes physically reach the slave through PINMUX_2.
 
-What's still being chased:
-- End-to-end frame capture (a full `iq_spi_frame_t` arriving with correct magic/version/payload). The project is in the "stare at minicom output and chase the SPI slave RX path" phase.
+What's still being chased (open issues, in priority order):
+
+1. **Pi-side: `rpi_bridge` cannot open the RTL-SDR.** `rtlsdr_open` returns `-1` (`LIBUSB_ERROR_IO`) on most runs because the kernel keeps loading `rtl2832_sdr` and `dvb_usb_rtl28xxu`. The blacklist file under `/etc/modprobe.d/` needs to include both module names plus `dvb_usb_v2`, followed by `update-initramfs -u` and a reboot. `rtl_test` is misleading here: it succeeds even when `rpi_bridge` can't open the device, because `rtl_test` calls `libusb_detach_kernel_driver` to forcibly steal the dongle.
+2. **Efficient-side: ATCSPI200 register layout is not fully understood on this part.** Empirically:
+   - `TRANSFMT` only partially accepts writes. We write `0x00000704` (SLVMODE=1, DATALEN=7) and read back `0x00000025` — bits 8–12 (DATALEN) silently refuse to take, and the hardware also reverts SLVMODE between transactions (TRANSFMT seen to drift from `0x025` → `0x0a` → `0x00` over a few hundred bytes). Force-rewriting TRANSFMT on every frame attempt does not help.
+   - `STATUS.RXEMPTY` (claimed bit 14 in the header) is never observed set, even directly after `CTRL.RXFIFORST`. Likely the bit position is different on this variant. Until that's resolved, the polling loop treats an empty FIFO as "not empty" and reads ghost zeros forever — bounded to 10000 bytes/iter so the heartbeat still flows.
+   - Reading `INTRST` returns garbage (it's `__O` write-only in the SDK header). Do not read it.
+3. **End-to-end frame capture.** A full `iq_spi_frame_t` arriving with correct magic (`30 51 51 49` on the wire), version (1), payload_bytes (2048). Blocked on (1) and (2) above.
+
+UART output gotcha: `eff_uart_puts(UART_DEV, ...)` is **non-blocking** on this chip. Back-to-back calls overflow the TX FIFO and visibly interleave/garble output. `printf` via stdio (with `-DEFF_STDIO_PORT=3`) is synchronous and does not. **Use `printf`/`dbg()` (which wraps `vprintf`) for all debug output, not `eff_uart_puts` directly.**
 
 Other artifacts in the folder:
 - `power.csv`, `power_SDR.csv`, `report.txt`, `report_sdr.txt`, `sample_SDR.log`, `parsed_iq.txt`, `raw.iq` — captures from earlier offline experiments.
@@ -101,21 +109,46 @@ You should see the boot banner `=== spi0 smoke: UART_3 alive ===` followed by pe
 
 ### On the Raspberry Pi (host side, separate machine)
 
+One-time setup: blacklist the kernel DVB modules so they don't steal the RTL-SDR dongle. Without this, `rpi_bridge` fails with `rtlsdr_open failed: -1` (`LIBUSB_ERROR_IO`) on most runs because the kernel's `dvb_usb_rtl28xxu` driver has claimed the USB interface.
+
+```bash
+sudo tee /etc/modprobe.d/blacklist-rtl.conf <<'EOF'
+blacklist rtl2832_sdr
+blacklist dvb_usb_rtl28xxu
+blacklist dvb_usb_v2
+blacklist rtl2832
+blacklist rtl2830
+EOF
+sudo update-initramfs -u
+sudo reboot
+```
+
+After reboot, verify the modules really are gone before running anything else:
+
+```bash
+lsmod | grep -iE 'rtl|dvb'   # expect EMPTY output
+lsusb                          # should still show Realtek RTL2838
+```
+
 Build and run the bridge:
 
 ```bash
 gcc -O2 -Wall -Wextra -o rpi_bridge rpi_rtlsdr_spi_bridge.c -lrtlsdr -lpthread
-sudo ./rpi_bridge /dev/spidev0.0 1575420000 1024000 20000000 0
-#                  ^spi dev      ^center Hz  ^fs Hz   ^SPI Hz   ^gain (0=auto)
+sudo ./rpi_bridge /dev/spidev0.0 1575420000 1024000 1000000 0
+#                  ^spi dev      ^center Hz  ^fs Hz   ^SPI Hz  ^gain (0=auto)
 ```
 
-Start the Pi bridge **after** the Argus3 board is flashed and printing heartbeats — the slave needs to be drained and listening before the master starts clocking, otherwise the first frame's magic gets eaten.
+SPI clock is currently held at 1 MHz while bringing up the slave RX path; once that's stable we'll push it back toward 20 MHz. Start the Pi bridge **after** the Argus3 board is flashed and printing heartbeats — the slave needs to be drained and listening before the master starts clocking, otherwise the first frame's magic gets eaten.
+
+Quick diagnostic if `rpi_bridge` fails: `rtl_test -t` will succeed even when `rpi_bridge` cannot (it force-detaches the kernel driver). Don't take a passing `rtl_test` as proof the bridge will work — only `lsmod` showing zero rtl/dvb modules confirms the blacklist is in effect.
 
 ## TODOs
 
 Near-term (unblock the data path):
-- [ ] Get a clean `iq_spi_frame_t` from Pi -> Efficient end-to-end (correct magic, version, payload). Currently chasing this in `main_spi0_smoke.c`.
-- [ ] Once frames are stable, strip the verbose `[DEBUG]` instrumentation from the hot path — every UART TX inside `spi0_poll_byte` costs us bytes at 20 MHz SPI.
+- [ ] **Pi**: confirm post-reboot `lsmod | grep -iE 'rtl|dvb'` is empty and `rpi_bridge` reaches the per-frame send loop.
+- [ ] **Efficient**: get the actual `STATUS` and `TRANSFMT` bit-field definitions out of the on-disk `atcspi200.h` (the values we've been using do not match the hardware's behavior — `RXEMPTY` is never observed set, `DATALEN` writes are silently dropped, SLVMODE reverts between transactions). Until this is grounded in the real header, the slave RX path is guesswork.
+- [ ] Get a clean `iq_spi_frame_t` from Pi -> Efficient end-to-end (correct magic, version, payload). Blocked on the two items above.
+- [ ] Once frames are stable, strip the one-shot probe instrumentation (`p_entry`, `p_status_1st`, …) from `spi0_poll_byte` and the bulky heartbeat dump — every UART TX costs us bytes at higher SPI clocks.
 - [ ] Decide on overrun handling: today we rely on per-byte timeouts; if the FIFO genuinely overflows we want explicit detection (not via `INTRST` reads — that register is `__O` write-only on this IP and gave false positives).
 - [ ] Fix the stray trailing `5` in `run_simple.sh`.
 
