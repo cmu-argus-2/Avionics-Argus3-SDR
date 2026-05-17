@@ -167,15 +167,38 @@ static int spi0_init(void)
 
     ATCSPI200_RegDef *atc = (ATCSPI200_RegDef *)SPI_0->base_address;
 
-    /* (1) + (2): flip to slave mode AND disable DATAMERGE in a single
-     * RMW so the hardware never sees a transient "slave + merged"
-     * state (which the IP may or may not support). */
-    uint32_t fmt = atc->TRANSFMT;
-    fmt |=  ATCSPI200_TRANSFMT_SLVMODE_MASK;
-    fmt &= ~ATCSPI200_TRANSFMT_DATAMERGE_MASK;
+    /* Log the post-eff_spi_init register state so we can see what the
+     * SDK left us with before we override it. */
+    uint32_t fmt_before = atc->TRANSFMT;
+    printf("[INIT] TRANSFMT before = 0x%08lx\r\n", (unsigned long)fmt_before);
+
+    /* Write TRANSFMT explicitly with ALL fields — don't RMW. The
+     * previous OR-in-SLVMODE approach didn't stick: readback showed
+     * 0x0a (SLVMODE clear, DATALEN=0 i.e. 1-bit words). The cause is
+     * unclear, but a clean full-word write should be unambiguous.
+     *
+     * Field plan for SPI mode 0, MSB first, 8-bit slave RX:
+     *   bit 0  CPHA      = 0
+     *   bit 1  CPOL      = 0
+     *   bit 2  SLVMODE   = 1   ← we are the slave
+     *   bit 3  LSB       = 0   (MSB first — matches the Pi)
+     *   bit 4  MOSIBIT   = 0
+     *   bit 7  DATAMERGE = 0   ← one received byte per DATA read
+     *   bits 12:8 DATALEN= 7   ← 8-bit words (length = N+1)
+     * Everything else 0.
+     *
+     * Encoded value: 0x00000704 */
+    uint32_t fmt = (1u << 2)        /* SLVMODE */
+                 | (7u << 8);       /* DATALEN = 7 → 8-bit data */
     atc->TRANSFMT = fmt;
 
-    /* (3) flush anything stale from the RX FIFO. RXFIFORST self-clears
+    /* Read back and shout if the write didn't land. */
+    uint32_t fmt_after = atc->TRANSFMT;
+    printf("[INIT] TRANSFMT wrote 0x%08lx  read 0x%08lx %s\r\n",
+           (unsigned long)fmt, (unsigned long)fmt_after,
+           (fmt_after == fmt) ? "(OK)" : "(MISMATCH!)");
+
+    /* Flush anything stale from the RX FIFO. RXFIFORST self-clears
      * after the hardware completes the reset; bounded wait so a stuck
      * bit can't hang us here. */
     atc->CTRL |= ATCSPI200_CTRL_RXFIFORST_MASK;
@@ -184,9 +207,13 @@ static int spi0_init(void)
         /* spin */
     }
 
-    /* (4) clear all W1C interrupt-status bits. Writing the current
-     * value back clears exactly whichever bits were set. */
-    atc->INTRST = atc->INTRST;
+    /* Post-reset snapshot. STATUS should now show RXEMPTY=1 (bit 14,
+     * mask 0x4000) since we just flushed the FIFO. If it doesn't,
+     * either our STATUS layout is wrong or the FIFO reset didn't take. */
+    uint32_t st_after = atc->STATUS;
+    printf("[INIT] post-reset STATUS = 0x%08lx (RXEMPTY %s)\r\n",
+           (unsigned long)st_after,
+           (st_after & ATCSPI200_STATUS_RXEMPTY_MASK) ? "set" : "CLEAR");
 
     return 0;
 }
@@ -409,7 +436,7 @@ int main(void)
     static iq_spi_frame_t frame;
     int rc;
 
-    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v14 all-printf]\r\n");
+    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v15 explicit-transfmt]\r\n");
 
     rc = spi0_init();
     if (rc) {
