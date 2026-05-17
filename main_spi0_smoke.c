@@ -337,8 +337,23 @@ static int spi0_poll_byte(uint8_t *b, uint32_t budget)
  * Note: this function is SILENT. No dbg() calls, no prints. Every
  * UART TX in here used to push us over the byte-time budget at 20 MHz
  * SPI and caused the exact overruns we were trying to diagnose. */
+/* Re-assert TRANSFMT every time we want to read. The hardware
+ * empirically reverts TRANSFMT between transactions on this part
+ * (SLVMODE seen to clear between init and the very next heartbeat;
+ * TRANSFMT seen to reach 0x00 after a few hundred bytes are clocked).
+ * Easier to just rewrite it than to chase the trigger. */
+static void spi0_force_transfmt(void)
+{
+    ATCSPI200_RegDef *atc = (ATCSPI200_RegDef *)SPI_0->base_address;
+    uint32_t fmt = (1u << 2)        /* SLVMODE */
+                 | (7u << 8);       /* DATALEN = 7 → 8-bit data */
+    atc->TRANSFMT = fmt;
+}
+
 static int spi0_read_frame(iq_spi_frame_t *frame)
 {
+    /* Force TRANSFMT every entry — hardware loses our SLVMODE setting. */
+    spi0_force_transfmt();
     /* Separate the three budgets so each has clear meaning:
      *   SEARCH_MAX_BYTES — how many bytes we'll consume while
      *                      searching for magic before giving up and
@@ -436,7 +451,7 @@ int main(void)
     static iq_spi_frame_t frame;
     int rc;
 
-    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v15 explicit-transfmt]\r\n");
+    dbg("[DEBUG] spi0 smoke start (direct-register slave RX) [build-v16 force-transfmt]\r\n");
 
     rc = spi0_init();
     if (rc) {
